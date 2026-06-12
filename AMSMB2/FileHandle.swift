@@ -179,12 +179,7 @@ final class SMB2FileHandle: @unchecked Sendable {
     }
 
     deinit {
-        do {
-            let handle = try self.handle.unwrap()
-            try client.async_await { context, cbPtr -> Int32 in
-                smb2_close_async(context, handle, SMB2Client.generic_handler, cbPtr)
-            }
-        } catch {}
+        try? close()
     }
 
     var fileId: UUID {

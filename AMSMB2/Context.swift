@@ -388,32 +388,22 @@ extension SMB2Client {
         var status: NTStatus {
             NTStatus(rawValue: result)
         }
-    }
-    
-    private class AsyncCallbackData<T> {
-        var continuation: CheckedContinuation<T, any Error>
-        
-        init(continuation: CheckedContinuation<T, any Error>) {
-            self.continuation = continuation
+
+        func finish(status: Int32, commandData: UnsafeMutableRawPointer?) {
+            if NTStatus(rawValue: status) != .success {
+                result = status
+            }
+            dataHandler?(commandData)
+            dataHandler = nil
+            isFinished = true
+        }
+
+        func detachHandler() {
+            dataHandler = nil
         }
     }
-    
-    private func wait(_ cb: inout CBData) async throws {
-        let startDate = Date()
-        let source = switch try whichEvents() {
-        case Int16(POLL_IN):
-            DispatchSource.makeReadSource(fileDescriptor: fileDescriptor.rawValue)
-        case Int16(POLL_OUT):
-            DispatchSource.makeWriteSource(fileDescriptor: fileDescriptor.rawValue)
-        default:
-            throw POSIXError(errno, description: errorString)
-        }
-        source.setEventHandler {
-            return
-        }
-        
-    }
-    private func wait_for_reply(_ cb: inout CBData) throws {
+
+    private func wait_for_reply(_ cb: CBData) throws {
         let startDate = Date()
         while !cb.isFinished {
             var pfd = pollfd()
@@ -435,15 +425,19 @@ extension SMB2Client {
     }
 
     static let generic_handler: smb2_command_cb = { smb2, status, command_data, cbdata in
+        guard let cbdata else { return }
+        let callbackData = Unmanaged<CBData>.fromOpaque(cbdata).takeRetainedValue()
         do {
-            guard try smb2.unwrap().pointee.fd > 0 else { return }
-            let cbdata = try cbdata.unwrap().bindMemory(to: CBData.self, capacity: 1).pointee
-            if NTStatus(rawValue: status) != .success {
-                cbdata.result = status
+            guard try smb2.unwrap().pointee.fd > 0 else {
+                callbackData.detachHandler()
+                callbackData.isFinished = true
+                return
             }
-            cbdata.dataHandler?(command_data)
-            cbdata.isFinished = true
-        } catch {}
+            callbackData.finish(status: status, commandData: command_data)
+        } catch {
+            callbackData.detachHandler()
+            callbackData.isFinished = true
+        }
     }
 
     typealias ContextHandler<R> = (_ client: SMB2Client, _ dataPtr: UnsafeMutableRawPointer?)
@@ -465,7 +459,8 @@ extension SMB2Client {
         throws -> (result: Int32, data: DataType)
     {
         try withThreadSafeContext { context -> (Int32, DataType) in
-            var cb = CBData()
+            let cb = CBData()
+            let cbPtr = Unmanaged.passRetained(cb).toOpaque()
             var resultData: DataType?
             var dataHandlerError: (any Error)?
             cb.dataHandler = { ptr in
@@ -475,11 +470,27 @@ extension SMB2Client {
                     dataHandlerError = error
                 }
             }
-            let result = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb)
+
+            let result: Int32
+            do {
+                result = try handler(context, cbPtr)
+                try POSIXError.throwIfError(result, description: errorString)
+            } catch {
+                cb.detachHandler()
+                // Some compound calls can invoke the callback synchronously before returning an error.
+                if !cb.isFinished {
+                    Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                }
+                throw error
             }
-            try POSIXError.throwIfError(result, description: errorString)
-            try wait_for_reply(&cb)
+
+            do {
+                try wait_for_reply(cb)
+            } catch {
+                // If no late callback arrives this leaks only the detached shell; releasing here risks UAF.
+                cb.detachHandler()
+                throw error
+            }
             let cbResult = cb.result
             
             try POSIXError.throwIfError(cbResult, description: errorString)
@@ -503,7 +514,8 @@ extension SMB2Client {
         throws -> (status: UInt32, data: DataType)
     {
         try withThreadSafeContext { context -> (UInt32, DataType) in
-            var cb = CBData()
+            let cb = CBData()
+            let cbPtr = Unmanaged.passRetained(cb).toOpaque()
             var resultData: DataType?
             var dataHandlerError: (any Error)?
             cb.dataHandler = { ptr in
@@ -513,11 +525,23 @@ extension SMB2Client {
                     dataHandlerError = error
                 }
             }
-            let pdu = try withUnsafeMutablePointer(to: &cb) { cb in
-                try handler(context, cb).unwrap()
+
+            let pdu: UnsafeMutablePointer<smb2_pdu>
+            do {
+                pdu = try handler(context, cbPtr).unwrap()
+            } catch {
+                cb.detachHandler()
+                Unmanaged<CBData>.fromOpaque(cbPtr).release()
+                throw error
             }
             smb2_queue_pdu(context, pdu)
-            try wait_for_reply(&cb)
+            do {
+                try wait_for_reply(cb)
+            } catch {
+                // If no late callback arrives this leaks only the detached shell; releasing here risks UAF.
+                cb.detachHandler()
+                throw error
+            }
 
             try cb.status.throwIfError()
             if let error = dataHandlerError { throw error }
