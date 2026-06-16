@@ -1282,6 +1282,29 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         at url: URL, toPath: String, progress: WriteProgressHandler,
         completionHandler: SimpleCompletionHandler
     ) {
+        uploadItem(
+            at: url, toPath: toPath, overwrite: false, progress: progress,
+            completionHandler: completionHandler
+        )
+    }
+
+    /**
+     Uploads local file contents to a location, optionally replacing an existing file. With reporting progress on about every 1MiB.
+
+     - Note: given url must be local file url otherwise it will throw error.
+
+     - Parameters:
+       - at: url of a local file to be uploaded from.
+       - toPath: path of file to be uploaded to.
+       - overwrite: if `true`, an existing file at `toPath` will be truncated and replaced.
+       - progress: reports progress of written bytes count so far.
+           User must return `true` if they want to continuing or `false` to abort copying.
+       - completionHandler: closure will be run after uploading is completed.
+     */
+    open func uploadItem(
+        at url: URL, toPath: String, overwrite: Bool, progress: WriteProgressHandler,
+        completionHandler: SimpleCompletionHandler
+    ) {
         with(completionHandler: completionHandler) { client in
             guard try url.checkResourceIsReachable(), url.isFileURL,
                   let stream = InputStream(url: url)
@@ -1293,7 +1316,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 )
             }
 
-            try self.write(client: client, from: stream, toPath: toPath, progress: progress)
+            try self.write(client: client, from: stream, toPath: toPath, overwrite: overwrite, progress: progress)
         }
     }
 
@@ -1314,6 +1337,29 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         try await withCheckedThrowingContinuation { continuation in
             uploadItem(
                 at: url, toPath: toPath, progress: progress,
+                completionHandler: asyncHandler(continuation)
+            )
+        }
+    }
+
+    /**
+     Uploads local file contents to a location, optionally replacing an existing file. With reporting progress on about every 1MiB.
+
+     - Note: given url must be local file url otherwise it will throw error.
+
+     - Parameters:
+       - at: url of a local file to be uploaded from.
+       - toPath: path of file to be uploaded to.
+       - overwrite: if `true`, an existing file at `toPath` will be truncated and replaced.
+       - progress: reports progress of written bytes count so far.
+           User must return `true` if they want to continuing or `false` to abort copying.
+     */
+    open func uploadItem(
+        at url: URL, toPath: String, overwrite: Bool, progress: WriteProgressHandler
+    ) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            uploadItem(
+                at: url, toPath: toPath, overwrite: overwrite, progress: progress,
                 completionHandler: asyncHandler(continuation)
             )
         }
@@ -1701,13 +1747,15 @@ extension SMB2Manager {
 
     private func write(
         client: SMB2Client, from stream: InputStream, toPath: String,
-        offset: Int64? = nil, chunkSize: Int = 0, progress: WriteProgressHandler
+        offset: Int64? = nil, overwrite: Bool = false, chunkSize: Int = 0, progress: WriteProgressHandler
     ) throws {
         let file: SMB2FileHandle
         if let offset {
             try client.resize(toPath, to: .init(offset))
             file = try SMB2FileHandle(forOutputAtPath: toPath, on: client)
             try file.seek(offset: offset, from: .start)
+        } else if overwrite {
+            file = try SMB2FileHandle(forOverwritingOrCreatingAtPath: toPath, on: client)
         } else {
             file = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
         }

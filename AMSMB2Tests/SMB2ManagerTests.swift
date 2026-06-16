@@ -405,10 +405,12 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         let size: Int = random(max: 0xf00000)
         print(#function, "test size:", size)
         let url = dummyFile(size: size)
+        let replacementURL = dummyFile(size: max(size / 2, 1), name: "testUploadDownloadReplacement")
         let dlURL = url.appendingPathExtension("downloaded")
 
         addTeardownBlock {
             try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: replacementURL)
             try? FileManager.default.removeItem(at: dlURL)
             try? await smb.removeFile(atPath: fileName())
             try await smb.disconnectShare(gracefully: true)
@@ -431,6 +433,7 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
             XCTAssertNotNil(error)
             XCTAssertEqual(error?.code, POSIXErrorCode.EEXIST)
         }
+        try await smb.uploadItem(at: replacementURL, toPath: fileName(), overwrite: true, progress: nil)
 
         try await smb.downloadItem(
             atPath: fileName(), to: dlURL,
@@ -441,7 +444,7 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
                 return true
             }
         )
-        XCTAssert(FileManager.default.contentsEqual(atPath: url.path, andPath: dlURL.path))
+        XCTAssert(FileManager.default.contentsEqual(atPath: replacementURL.path, andPath: dlURL.path))
 
         try await smb.echo()
     }

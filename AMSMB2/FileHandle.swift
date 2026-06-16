@@ -89,6 +89,10 @@ final class SMB2FileHandle: @unchecked Sendable {
         try self.init(path, .writeOnly, options: [.truncate], on: client)
     }
 
+    convenience init(forOverwritingOrCreatingAtPath path: String, on client: SMB2Client) throws {
+        try self.init(path, .writeOnly, options: [.create, .truncate], on: client)
+    }
+
     convenience init(forOutputAtPath path: String, on client: SMB2Client) throws {
         try self.init(path, .writeOnly, options: [.create], on: client)
     }
