@@ -402,10 +402,10 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
 
     func testUploadDownload() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
-        let size: Int = random(max: 0xf00000)
+        let size: Int = max(random(max: 0xf00000), 4096)
         print(#function, "test size:", size)
         let url = dummyFile(size: size)
-        let replacementURL = dummyFile(size: max(size / 2, 1), name: "testUploadDownloadReplacement")
+        let replacementURL = dummyFile(size: 1, name: "testUploadDownloadReplacement")
         let dlURL = url.appendingPathExtension("downloaded")
 
         addTeardownBlock {
@@ -434,6 +434,8 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
             XCTAssertEqual(error?.code, POSIXErrorCode.EEXIST)
         }
         try await smb.uploadItem(at: replacementURL, toPath: fileName(), overwrite: true, progress: nil)
+        let attributes = try await smb.attributesOfItem(atPath: fileName())
+        XCTAssertEqual((attributes[.fileSizeKey] as? NSNumber)?.intValue, 1)
 
         try await smb.downloadItem(
             atPath: fileName(), to: dlURL,
