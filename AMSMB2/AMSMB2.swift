@@ -545,40 +545,49 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     ) {
         var stat = smb2_stat_64()
         var smb2Attributes = SMB2FileHandle.Attributes()
-        for attribute in attributes {
-            switch attribute.key {
-            case .creationDateKey:
-                attributes.creationDate.map(timespec.init).map {
-                    stat.smb2_btime = .init($0.tv_sec)
-                    stat.smb2_btime_nsec = .init($0.tv_nsec)
+        do {
+            for attribute in attributes {
+                switch attribute.key {
+                case .creationDateKey:
+                    if let date = attributes.creationDate {
+                        let timestamp = try SMB2Timestamp(date)
+                        stat.smb2_btime = timestamp.seconds
+                        stat.smb2_btime_nsec = timestamp.nanoseconds
+                    }
+                case .contentAccessDateKey:
+                    if let date = attributes.contentAccessDate {
+                        let timestamp = try SMB2Timestamp(date)
+                        stat.smb2_atime = timestamp.seconds
+                        stat.smb2_atime_nsec = timestamp.nanoseconds
+                    }
+                case .contentModificationDateKey:
+                    if let date = attributes.contentModificationDate {
+                        let timestamp = try SMB2Timestamp(date)
+                        stat.smb2_mtime = timestamp.seconds
+                        stat.smb2_mtime_nsec = timestamp.nanoseconds
+                    }
+                case .attributeModificationDateKey:
+                    if let date = attributes.attributeModificationDate {
+                        let timestamp = try SMB2Timestamp(date)
+                        stat.smb2_ctime = timestamp.seconds
+                        stat.smb2_ctime_nsec = timestamp.nanoseconds
+                    }
+                case .isUserImmutableKey:
+                    guard let value = attribute.value as? Bool else { break }
+                    smb2Attributes.insert(value ? .readonly : .normal)
+                case .isSystemImmutableKey:
+                    guard let value = attribute.value as? Bool else { break }
+                    smb2Attributes.insert(value ? .system : .normal)
+                case .isHiddenKey:
+                    guard let value = attribute.value as? Bool else { break }
+                    smb2Attributes.insert(value ? .hidden : .normal)
+                default:
+                    break
                 }
-            case .contentAccessDateKey:
-                attributes.contentAccessDate.map(timespec.init).map {
-                    stat.smb2_atime = .init($0.tv_sec)
-                    stat.smb2_atime_nsec = .init($0.tv_nsec)
-                }
-            case .contentModificationDateKey:
-                attributes.contentModificationDate.map(timespec.init).map {
-                    stat.smb2_mtime = .init($0.tv_sec)
-                    stat.smb2_mtime_nsec = .init($0.tv_nsec)
-                }
-            case .attributeModificationDateKey:
-                attributes.contentModificationDate.map(timespec.init).map {
-                    stat.smb2_ctime = .init($0.tv_sec)
-                    stat.smb2_ctime_nsec = .init($0.tv_nsec)
-                }
-            case .isUserImmutableKey:
-                guard let value = attribute.value as? Bool else { break }
-                smb2Attributes.insert(value ? .readonly : .normal)
-            case .isSystemImmutableKey:
-                guard let value = attribute.value as? Bool else { break }
-                smb2Attributes.insert(value ? .system : .normal)
-            case .isHiddenKey:
-                guard let value = attribute.value as? Bool else { break }
-                smb2Attributes.insert(value ? .hidden : .normal)
-            default:
-                break
             }
+        } catch {
+            completionHandler?(error)
+            return
         }
         
         if smb2Attributes.subtracting(.normal) != [] {

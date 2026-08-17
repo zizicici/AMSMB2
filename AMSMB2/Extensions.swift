@@ -188,10 +188,37 @@ extension Date {
     }
 }
 
-extension timespec {
-    init(_ date: Date) {
+struct SMB2Timestamp: Equatable, Sendable {
+    let seconds: UInt64
+    let nanoseconds: UInt64
+
+    init(_ date: Date) throws {
         let interval = date.timeIntervalSince1970
-        self.init(tv_sec: .init(interval), tv_nsec: Int(interval.truncatingRemainder(dividingBy: 1) * Double(NSEC_PER_SEC)))
+        guard interval.isFinite, interval >= 0 else {
+            throw Self.invalidDateError
+        }
+
+        let integralSeconds = interval.rounded(.down)
+        guard let signedSeconds = Int64(exactly: integralSeconds) else {
+            throw Self.invalidDateError
+        }
+
+        let fractionalSeconds = interval - integralSeconds
+        let scaledNanoseconds = (fractionalSeconds * Double(NSEC_PER_SEC)).rounded(.towardZero)
+        guard let nanoseconds = UInt64(exactly: scaledNanoseconds),
+              nanoseconds < UInt64(NSEC_PER_SEC) else {
+            throw Self.invalidDateError
+        }
+
+        self.seconds = UInt64(signedSeconds)
+        self.nanoseconds = nanoseconds
+    }
+
+    private static var invalidDateError: POSIXError {
+        POSIXError(
+            .invalidArgument,
+            description: "Date cannot be represented by libsmb2's unsigned timestamp fields."
+        )
     }
 }
 
