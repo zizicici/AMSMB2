@@ -1,0 +1,1 @@
+../libsmb2/include/libsmb2-private.h

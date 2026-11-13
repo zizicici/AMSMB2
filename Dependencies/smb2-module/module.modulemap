@@ -1,0 +1,16 @@
+module SMB2 [system] [extern_c] {
+    module LibSMB2 {
+        header "../libsmb2/include/apple/config.h"
+        header "../libsmb2/include/smb2/smb2-errors.h"
+        header "../libsmb2/include/smb2/smb2.h"
+        header "../libsmb2/include/smb2/libsmb2.h"
+        header "../libsmb2/include/smb2/libsmb2-raw.h"
+        header "../libsmb2/include/smb2/libsmb2-share-enum.h"
+    }
+
+    module Internal {
+        header "../libsmb2/include/libsmb2-private.h"
+    }
+
+    export *
+}

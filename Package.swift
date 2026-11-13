@@ -31,26 +31,34 @@ let package = Package(
     targets: [
         .target(
             name: "libsmb2",
-            path: "Dependencies/libsmb2",
+            // Target root is our Dependencies/ dir (not the submodule) so the module map
+            // can live in smb2-module/: upstream master's include/module.modulemap still
+            // references dcerpc headers that were relocated into libdcerpc/ and does not
+            // cover libsmb2-share-enum.h, so it cannot be used as-is.
+            path: "Dependencies",
             exclude: [
-                "lib/CMakeLists.txt",
-                "lib/libsmb2.syms",
-                "lib/Makefile.am",
-                "lib/Makefile.AMIGA",
-                "lib/Makefile.AMIGA_AROS",
-                "lib/Makefile.AMIGA_OS3",
-                "lib/Makefile.PS3_PPU",
-                "lib/ps2",
+                "libsmb2/lib/CMakeLists.txt",
+                "libsmb2/lib/libsmb2.syms",
+                "libsmb2/lib/Makefile.am",
+                "libsmb2/lib/Makefile.AMIGA",
+                "libsmb2/lib/Makefile.AMIGA_AROS",
+                "libsmb2/lib/Makefile.AMIGA_OS3",
+                "libsmb2/lib/Makefile.PS3_PPU",
+                "libsmb2/lib/ps2",
+                "libsmb2/lib/dreamcast",
+                "libsmb2/include/module.modulemap",
             ],
             sources: [
-                "lib",
+                "libsmb2/lib",
             ],
-            publicHeadersPath: "include",
+            publicHeadersPath: "smb2-module",
             cSettings: [
-                .headerSearchPath("include"),
-                .headerSearchPath("include/apple"),
-                .headerSearchPath("include/smb2"),
-                .headerSearchPath("lib"),
+                // Search headers through the shim so upstream's stale
+                // include/module.modulemap never lands on a module search path.
+                .headerSearchPath("smb2-module"),
+                .headerSearchPath("smb2-module/apple"),
+                .headerSearchPath("smb2-module/smb2"),
+                .headerSearchPath("libsmb2/lib"),
                 .define("_U_", to: "__attribute__((unused))"),
                 .define("HAVE_CONFIG_H", to: "1"),
             ],
