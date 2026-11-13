@@ -12,20 +12,35 @@ at the bottom.
 
 ## 1. ~~[P1] Compound commands share one callback state that the last callback frees~~ — FIXED in the fork
 
-**Fix**: `compound-cb-refcount` branch (zizicici/libsmb2). Every shared
-`*_cb_data` now carries a `pending` count equal to the number of compound
-PDUs holding it; each member callback accumulates its status and drops one
-reference on **every** exit path, and the drop that reaches zero performs the
-completion (invoke the user callback, free the state). Any firing order —
-reply order, PDU timeout or context teardown — now completes exactly once.
-The symlink failure-path cleanup unlink transfers its reference to the
-cleanup continuation.
+**Fix**: zizicici/libsmb2 branch `compound-cb-refcount`, carried by the pinned
+submodule commit:
+
+- `933b2a4` — every shared `*_cb_data` carries a `pending` count equal to the
+  number of compound PDUs holding it; each member callback accumulates its
+  status and drops one reference on **every** exit path, and the drop that
+  reaches zero performs the completion (invoke the user callback, free the
+  state). Any firing order — reply order, PDU timeout or context teardown —
+  now completes exactly once. The symlink failure-path cleanup unlink
+  transfers its reference to the cleanup continuation. `smb2_timeout_pdus()`
+  (issue 3) is fixed in the same commit.
+- `5789b33` — `smb2_queue_pdu()` fires every chain member before freeing on
+  an encryption abort (the same invariant at queue time), and three
+  allocation-failure paths release their callback state.
+- `c3ea44c` — a refused connect on macOS (POLLHUP-only) now completes the
+  pending connect callback with the real `SO_ERROR` errno like POLLERR does;
+  `nterror_to_errno(SMB2_STATUS_SHUTDOWN)` maps to EIO instead of the
+  meaningless EPERM; the notify chain is freed iteratively; and the
+  encryption-abort path no longer double-frees `caller_frees_pdu` PDUs the
+  synchronous wrappers own.
 
 Regression coverage: `SMB2LifetimeTests.test{Stat,Rename,Truncate,Readlink}-
 CompoundPartialReplyTimeoutAbortsAllMembersCleanly` reproduce the original
 heap-use-after-free (`getinfo_cb_1` reading freed `stat_cb_data` from
 `smb2_destroy_context`) on the pre-fix submodule under ASan and pass with the
-fix.
+fix. `SMB2RegressionTests.test_StatWithSealButNoKeyFailsFast` pins the
+queue-time abort firing; `test_ConnectRefusedSurfacesConnectionRefused` pins
+the refused-connect error. The compound-timeout cases only abort under ASan —
+run `make asan-test`.
 
 The original defect, kept for context:
 

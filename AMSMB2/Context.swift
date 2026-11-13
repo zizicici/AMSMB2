@@ -25,6 +25,13 @@ final class SMB2Client: CustomReflectable, @unchecked Sendable {
     private var context: UnsafeMutablePointer<smb2_context>?
     private let _context_lock = NSRecursiveLock()
 
+    /// True only while `smb2_service()` itself is on the stack, so callbacks
+    /// it fires can be told apart from callbacks fired during the teardown
+    /// inside `service()` (which only carry placeholder statuses). Accessed
+    /// on the service thread only; every operation holds the context lock
+    /// for its full duration.
+    private var isServicing = false
+
     init() throws {
         self.context = try smb2_init_context().unwrap()
     }
@@ -51,7 +58,10 @@ final class SMB2Client: CustomReflectable, @unchecked Sendable {
         defer {
             _context_lock.unlock()
         }
-        return try handler(context.unwrap())
+        guard let context else {
+            throw POSIXError(.socketNotConnected, description: "SMB2 context is already destroyed.")
+        }
+        return try handler(context)
     }
 
     public var customMirror: Mirror {
@@ -242,7 +252,9 @@ extension SMB2Client {
 
     func service(revents: Int32) throws {
         try withThreadSafeContext { context in
+            isServicing = true
             let result = smb2_service(context, revents)
+            isServicing = false
             if result < 0 {
                 let description = errorString
                 destroyContext()
@@ -385,6 +397,13 @@ extension SMB2Client {
         var result: Int32 = .init(NTStatus.success.rawValue)
         var isFinished: Bool = false
         var dataHandler: ((UnsafeMutableRawPointer?) -> Void)?
+        weak var client: SMB2Client?
+        /// Whether the completing callback fired while `smb2_service()` was
+        /// on the stack — i.e. it carries this operation's real result (a
+        /// delivered reply, or the connect callback with the actual connect
+        /// error). Callbacks fired during teardown inside `service()` only
+        /// carry placeholder statuses.
+        var completedDuringService = false
         var status: NTStatus {
             NTStatus(rawValue: result)
         }
@@ -449,15 +468,17 @@ extension SMB2Client {
             do {
                 try service(revents: Int32(pfd.revents))
             } catch {
-                // The reply may have been processed just before the connection
-                // failed; the call itself completed, so keep its result — the
-                // failure surfaces on the next operation, like libsmb2's own
-                // synchronous wait loop. A callback that only completed via
-                // the fd guard during teardown records a bare -1 placeholder
-                // (errno-shaped, no information about this operation); surface
-                // the connection failure with its description instead of
-                // letting it degrade to a meaningless EPERM.
-                if cb.isFinished, cb.result != -1 { break }
+                // A callback that completed while smb2_service() itself ran
+                // carries this operation's real result (a delivered reply, or
+                // the connect callback with the actual connect error) — keep
+                // it; the failure surfaces on the next operation, like
+                // libsmb2's own synchronous wait loop. A callback that only
+                // completed during the teardown inside service() carries a
+                // placeholder status (bare -1, or a negated cancellation);
+                // surface the connection failure with its description
+                // instead of letting the placeholder degrade into a
+                // meaningless errno.
+                if cb.completedDuringService { break }
                 throw error
             }
         }
@@ -466,6 +487,7 @@ extension SMB2Client {
     static let generic_handler: smb2_command_cb = { smb2, status, command_data, cbdata in
         guard let cbdata else { return }
         let callbackData = Unmanaged<CBData>.fromOpaque(cbdata).takeRetainedValue()
+        callbackData.completedDuringService = callbackData.client?.isServicing ?? false
         do {
             guard try smb2.unwrap().pointee.fd >= 0 else {
                 // Connect-stage failures and context teardown close the socket before
@@ -514,6 +536,7 @@ extension SMB2Client {
     {
         try withThreadSafeContext { context -> (Int32, DataType) in
             let cb = CBData()
+            cb.client = self
             let cbPtr = Unmanaged.passRetained(cb).toOpaque()
             var resultData: DataType?
             var dataHandlerError: (any Error)?
@@ -574,6 +597,7 @@ extension SMB2Client {
     {
         try withThreadSafeContext { context -> (UInt32, DataType) in
             let cb = CBData()
+            cb.client = self
             let cbPtr = Unmanaged.passRetained(cb).toOpaque()
             var resultData: DataType?
             var dataHandlerError: (any Error)?

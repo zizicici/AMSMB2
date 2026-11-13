@@ -32,7 +32,8 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
     override func setUpWithError() throws {
         try super.setUpWithError()
         try XCTSkipUnless(
-            ProcessInfo.processInfo.environment["SMB_SERVER"] != nil,
+            ProcessInfo.processInfo.environment["SMB_SERVER"] != nil
+                && ProcessInfo.processInfo.environment["SMB_SHARE"] != nil,
             "Set SMB_SERVER and SMB_SHARE (plus SMB_USER/SMB_PASSWORD as needed) to run these tests."
         )
     }

@@ -5,29 +5,35 @@ name: Swift
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
 
 jobs:
-  build:
-    name: Swift ${{ matrix.swift }} on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [macos-13]
-        swift: ["5.9", "5.8", "5.7", "5.6"]
-
+  test:
+    name: Build and test (macOS)
+    runs-on: macos-latest
     steps:
-    - uses: swift-actions/setup-swift@v1
+    - uses: actions/checkout@v4
       with:
-        swift-version: ${{ matrix.swift }}
-    - uses: actions/checkout@v3
+        # Package.swift compiles Dependencies/libsmb2 directly.
+        submodules: recursive
+    - name: Build
+      run: swift build
+    - name: Test
+      # Server-dependent tests skip themselves without SMB_SERVER/SMB_SHARE.
+      run: swift test
+
+  asan:
+    name: Memory-sanitized tests (macOS)
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
       with:
         submodules: recursive
-    - name: Get swift version
-      run: swift --version
-    - name: Build
-      run: swift build -v
-    - name: Run tests
-      run: swift test -v
+    - name: Test with AddressSanitizer
+      # The lifetime/regression suites reproduce the heap-use-after-free
+      # regressions this fork guards against; they only abort under ASan.
+      run: >
+        swift test --sanitize=address
+        --filter "SMB2LifetimeTests|SMB2RegressionTests|SMB2FileStatTests|SMB2TimestampTests"

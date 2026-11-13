@@ -18,6 +18,7 @@ import Glibc
 import System
 #else
 import SystemPackage
+import FoundationNetworking
 #endif
 @testable import AMSMB2
 import SMB2
@@ -87,12 +88,11 @@ final class SMB2RegressionTests: XCTestCase {
     func test_AsyncInputStreamPropagatesProducerErrorAfterDrain() {
         // Deterministic ordering: the first chunk is read out before the
         // producer is failed, so the failure can only surface on the next
-        // read.
+        // read. read() blocks until the chunk arrives, no polling needed.
         let (base, producer) = AsyncThrowingStream<Data, any Error>.makeStream()
         let stream = AsyncInputStream(stream: base)
         stream.open()
         producer.yield(Data([1, 2, 3]))
-        while !stream.hasBytesAvailable {}
         var buffer = [UInt8](repeating: 0, count: 16)
         XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), 3, "buffered data stays readable before the error")
         producer.finish(throwing: POSIXError(.EIO))
@@ -130,7 +130,10 @@ final class SMB2RegressionTests: XCTestCase {
         stream.open()
         let finished = expectation(description: "oversized chunk fully read")
         DispatchQueue.global().async {
-            defer { finished.fulfill() }
+            defer {
+                stream.close() // stop the prefetch task on failure paths too
+                finished.fulfill()
+            }
             var total = 0
             var buffer = [UInt8](repeating: 0, count: 64 * 1024)
             while true {
@@ -306,12 +309,11 @@ final class SMB2RegressionTests: XCTestCase {
             -> UnsafeMutablePointer<smb2_file_notify_change_information>
         {
             let node = UnsafeMutablePointer<smb2_file_notify_change_information>.allocate(capacity: 1)
-            let cString = name.utf8CString
-            let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: cString.count)
-            cString.withUnsafeBufferPointer { source in
-                nameBuffer.update(from: source.baseAddress!, count: source.count)
-            }
-            node.initialize(to: smb2_file_notify_change_information(action: action, name: nameBuffer, next: nil))
+            // strdup so the name is freed by C's free(), matching the
+            // chain's ownership contract exactly.
+            node.initialize(
+                to: smb2_file_notify_change_information(action: action, name: strdup(name), next: nil)
+            )
             return node
         }
 
@@ -340,8 +342,8 @@ final class SMB2RegressionTests: XCTestCase {
         // With seal negotiated but no session key, smb2_queue_pdu() fails to
         // encrypt and aborts the whole compound before it is sent. The
         // members' callbacks must fire at once (libsmb2 fork commit
-        // "complete compound state on queue-time aborts") instead of leaving
-        // the caller to time out.
+        // "complete compound state on queue-time aborts") with
+        // SMB2_STATUS_SHUTDOWN, which maps to EIO (not EPERM/ENOTCONN).
         let client = try SMB2Client()
         defer { client.destroyContext() }
         try client.withThreadSafeContext { context in
@@ -351,9 +353,58 @@ final class SMB2RegressionTests: XCTestCase {
         client.timeout = 5
         let started = Date()
         XCTAssertThrowsError(try client.stat("file")) { error in
-            print("seal-abort stat error:", error)
+            // The STATUS_SHUTDOWN in the description proves the compound
+            // members actually fired; without the fork fix the callback never
+            // runs and the caller sees a bare ENOTCONN from the dead socket.
+            XCTAssertEqual((error as? POSIXError)?.code, .EIO)
+            XCTAssertTrue(
+                (error as? POSIXError)?.localizedDescription.contains("SHUTDOWN") == true,
+                "expected the teardown status in the description, got: \(error)"
+            )
         }
         XCTAssertLessThan(Date().timeIntervalSince(started), 3, "must fail immediately, not via the timeout backstop")
+    }
+
+    // MARK: a refused connect surfaces ECONNREFUSED on every platform
+
+    func test_ConnectRefusedSurfacesConnectionRefused() throws {
+        // Reserve a port and release it again: connecting to the now-unbound
+        // port is refused. macOS reports that as POLLHUP (without POLLERR),
+        // and the connect callback must still complete with the real socket
+        // error instead of a teardown placeholder (which used to degrade
+        // into ENODATA "Invalid/Empty data." at the public API).
+        let reserved = socket(AF_INET, streamSocket, 0)
+        guard reserved >= 0 else { throw POSIXError(.EIO) }
+        defer { _ = close(reserved) }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let addressSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(reserved, $0, addressSize)
+            }
+        }
+        XCTAssertEqual(bound, 0)
+        var size = addressSize
+        let named = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(reserved, $0, &size) }
+        }
+        XCTAssertEqual(named, 0)
+        let port = UInt16(bigEndian: address.sin_port)
+        _ = close(reserved) // release: the port is unbound, connects get RST
+
+        let manager = SMB2Manager(url: URL(string: "smb://127.0.0.1:\(port)")!, credential: nil)!
+        manager.timeout = 5
+        let finished = expectation(description: "connect failed")
+        manager.connectShare(name: "share") { error in
+            defer { finished.fulfill() }
+            guard let posixError = error as? POSIXError else {
+                return XCTFail("Expected a POSIXError, got: \(String(describing: error))")
+            }
+            XCTAssertEqual(posixError.code, .ECONNREFUSED, "\(posixError)")
+        }
+        wait(for: [finished], timeout: 15)
     }
 }
 
