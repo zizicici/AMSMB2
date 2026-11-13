@@ -10,72 +10,63 @@
 import Foundation
 import SMB2
 
-typealias smb2dirPointer = UnsafeMutablePointer<smb2dir>?
+/// A directory entry copied out of libsmb2's directory cache.
+struct SMB2DirectoryEntry {
+    let name: String
+    let st: smb2_stat_64
+}
 
-/// - Note: This class is NOT thread-safe.
+/// A directory snapshot. Entries are copied out under a single context
+/// lock, so a disconnect while enumerating fails the listing instead of
+/// silently truncating it, and iterating reads Swift values only.
 final class SMB2Directory: Collection {
-    private let path: String
-    private let client: SMB2Client
-    private var handle: smb2dirPointer
+    private let entries: [SMB2DirectoryEntry]
 
     init(_ path: String, on client: SMB2Client) throws {
-        self.path = path
         let (_, handle) = try client.async_await(dataHandler: OpaquePointer.init) { context, cbPtr -> Int32 in
             smb2_opendir_async(context, path, SMB2Client.generic_handler, cbPtr)
         }
-        
-        self.client = client
-        self.handle = .init(handle)
+        let dir = UnsafeMutablePointer<smb2dir>(handle)
+
+        // Drain under one lock hold: releasing the context lock between
+        // reads would let a concurrent failure destroy the context, and a
+        // destroyed context must surface as an error rather than look
+        // like the end of the directory.
+        self.entries = try client.withThreadSafeContext { context -> [SMB2DirectoryEntry] in
+            // Entry names point into the directory handle, so they are
+            // copied into Swift strings before it is closed.
+            defer { smb2_closedir(context, dir) }
+            smb2_rewinddir(context, dir)
+            var entries = [SMB2DirectoryEntry]()
+            while let entry = smb2_readdir(context, dir)?.pointee {
+                guard let name = entry.name else { continue }
+                entries.append(.init(name: String(cString: name), st: entry.st))
+            }
+            return entries
+        }
     }
 
-    deinit {
-        try? client.withThreadSafeContext { context in
-            smb2_closedir(context, handle)
-        }
-    }
-    
-    func makeIterator() -> AnyIterator<smb2dirent> {
-        let context = client.context
-        smb2_rewinddir(context, handle)
-        return AnyIterator { [handle] in
-            smb2_readdir(context, handle)?.pointee
-        }
+    func makeIterator() -> IndexingIterator<[SMB2DirectoryEntry]> {
+        entries.makeIterator()
     }
 
     var startIndex: Int {
-        0
+        entries.startIndex
     }
 
     var endIndex: Int {
-        count
+        entries.endIndex
     }
 
     var count: Int {
-        let context = client.context
-        let currentPos = smb2_telldir(context, handle)
-        defer {
-            smb2_seekdir(context, handle, currentPos)
-        }
-
-        smb2_rewinddir(context, handle)
-        var result = 0
-        while smb2_readdir(context, handle) != nil {
-            result += 1
-        }
-        return result
+        entries.count
     }
 
-    subscript(_: Int) -> smb2dirent {
-        let context = client.context
-        let currentPos = smb2_telldir(context, handle)
-        smb2_seekdir(context, handle, 0)
-        defer {
-            smb2_seekdir(context, handle, currentPos)
-        }
-        return smb2_readdir(context, handle).pointee
+    subscript(index: Int) -> SMB2DirectoryEntry {
+        entries[index]
     }
 
     func index(after index: Int) -> Int {
-        index + 1
+        entries.index(after: index)
     }
 }

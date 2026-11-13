@@ -40,7 +40,6 @@ make cleanlinuxtest         # Clean Docker build
 - [Directory.swift](AMSMB2/Directory.swift) - Directory handle for enumeration
 - [Stream.swift](AMSMB2/Stream.swift) - InputStream/OutputStream implementations for streaming I/O
 - [Fsctl.swift](AMSMB2/Fsctl.swift) - FSCTL operations (server-side copy via IOCTL)
-- [MSRPC.swift](AMSMB2/MSRPC.swift) - MS-RPC protocol for share enumeration
 - [ObjCCompat.swift](AMSMB2/ObjCCompat.swift) - Objective-C compatibility layer with completion handler-based APIs
 
 ### Dependencies

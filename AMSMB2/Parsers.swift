@@ -9,7 +9,6 @@
 
 import Foundation
 import SMB2
-import SMB2.Raw
 
 struct EmptyReply: DecodableResponse {
     init(data _: Data) throws {}
@@ -24,19 +23,19 @@ extension String {
 
 extension Array where Element == SMB2Share {
     init(_ client: SMB2Client, _ dataPtr: UnsafeMutableRawPointer?) throws {
-        defer { smb2_free_data(client.context, dataPtr) }
-        let result = try dataPtr.unwrap().assumingMemoryBound(to: srvsvc_NetrShareEnum_rep.self).pointee
-        self = Array(result.ses.ShareInfo.Level1.Buffer.pointee)
-    }
-
-    init(_ ctr1: srvsvc_SHARE_INFO_1_carray) {
-        self = [srvsvc_SHARE_INFO_1](
-            UnsafeBufferPointer(start: ctr1.share_info_1, count: Int(ctr1.max_count))
-        ).map {
+        defer { try? client.withThreadSafeContext { smb2_free_data($0, dataPtr) } }
+        let reply = try dataPtr.unwrap().assumingMemoryBound(to: smb2_share_enum_reply.self).pointee
+        // The wrapper only requests level-1 enumeration.
+        guard reply.level == SMB2_SHARE_INFO_1.rawValue, let info = reply.share_info.info_1 else {
+            self = []
+            return
+        }
+        self = (0..<Int(reply.entries_read)).map { index in
             SMB2Share(
-                name: .init(cString: $0.netname.utf8),
-                props: .init(rawValue: $0.type),
-                comment: .init(cString: $0.remark.utf8)
+                // NDR unique pointers are legally NULL for empty name/remark.
+                name: info[index].netname.map { String(cString: $0) } ?? "",
+                props: .init(rawValue: info[index].type),
+                comment: info[index].remark.map { String(cString: $0) } ?? ""
             )
         }
     }
@@ -88,6 +87,18 @@ extension DecodableResponse {
             self = try Self(data: .init())
             return
         }
+        // The copychunk family decodes into fixed-size structs; output_count still
+        // carries the raw wire length and would overrun the allocation when copied.
+        let decodedLength: Int
+        switch reply.ctl_code {
+        case UInt32(SMB2_FSCTL_SRV_REQUEST_RESUME_KEY):
+            decodedLength = Int(SMB2_SRV_COPYCHUNK_RESUME_KEY_SIZE)
+        case UInt32(SMB2_FSCTL_SRV_COPYCHUNK), UInt32(SMB2_FSCTL_SRV_COPYCHUNK_WRITE):
+            decodedLength = MemoryLayout<smb2_srv_copychunk_reply>.stride
+        default:
+            decodedLength = Int(reply.output_count)
+        }
+        let length = min(decodedLength, Int(reply.output_count))
 // Check memory validity in order to prevent crash on invalid pointers
 #if canImport(Darwin)
         let pageSize = sysconf(_SC_PAGESIZE)
@@ -97,8 +108,8 @@ extension DecodableResponse {
             return
         }
 #endif
-        defer { smb2_free_data(client.context, output) }
-        let data = Data(bytes: output, count: Int(reply.output_count))
+        defer { try? client.withThreadSafeContext { smb2_free_data($0, output) } }
+        let data = Data(bytes: output, count: length)
         self = try Self(data: data)
     }
 }

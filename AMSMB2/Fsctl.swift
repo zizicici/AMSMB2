@@ -82,69 +82,6 @@ extension IOCtl.Command {
     static let dfsGetReferralsEx = Self(SMB2_FSCTL_DFS_GET_REFERRALS_EX)
 }
 
-// - MARK: Server-side Copy
-extension IOCtl.Command {
-    static let srvCopyChunk = Self(SMB2_FSCTL_SRV_COPYCHUNK)
-    static let srvCopyChunkWrite = Self(SMB2_FSCTL_SRV_COPYCHUNK_WRITE)
-    static let srvRequestResumeKey = Self(SMB2_FSCTL_SRV_REQUEST_RESUME_KEY)
-}
-
-extension IOCtl {
-    struct SrvCopyChunk: EncodableArgument {
-        typealias Element = UInt8
-        
-        let sourceOffset: UInt64
-        let targetOffset: UInt64
-        let length: UInt32
-        
-        var regions: [Data] {
-            [
-                .init(value: sourceOffset),
-                .init(value: targetOffset),
-                .init(value: length),
-                .init(value: 0 as UInt32),
-            ]
-        }
-        
-        init(sourceOffset: UInt64, targetOffset: UInt64, length: UInt32) {
-            self.sourceOffset = sourceOffset
-            self.targetOffset = targetOffset
-            self.length = length
-        }
-    }
-    
-    struct SrvCopyChunkCopy: EncodableArgument {
-        typealias Element = UInt8
-        
-        let sourceKey: Data
-        let chunks: [SrvCopyChunk]
-        
-        var regions: [Data] {
-            [
-                sourceKey,
-                .init(value: UInt32(chunks.count)),
-                .init(value: 0 as UInt32),
-            ] + chunks.flatMap(\.regions)
-        }
-        
-        init(sourceKey: Data, chunks: [SrvCopyChunk]) {
-            self.sourceKey = sourceKey
-            self.chunks = chunks
-        }
-    }
-    
-    struct RequestResumeKey: DecodableResponse {
-        let resumeKey: Data
-        
-        init(data: Data) throws {
-            guard data.count >= 24 else {
-                throw POSIXError(.invalidArgument, description: nil)
-            }
-            self.resumeKey = data.prefix(24)
-        }
-    }
-}
-
 // - MARK: Reparse Point
 extension IOCtl.Command {
     static let getReparsePoint = Self(SMB2_FSCTL_GET_REPARSE_POINT)

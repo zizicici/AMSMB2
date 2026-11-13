@@ -8,6 +8,7 @@
 import XCTest
 
 @testable import AMSMB2
+import SMB2
 
 final class SMB2TimestampTests: XCTestCase, @unchecked Sendable {
     func testConvertsUnixEpochAndFractionalSeconds() throws {
@@ -77,5 +78,26 @@ final class SMB2TimestampTests: XCTestCase, @unchecked Sendable {
 
     private func makeManager() -> SMB2Manager {
         SMB2Manager(url: URL(string: "smb://localhost")!, credential: nil)!
+    }
+}
+
+extension SMB2TimestampTests {
+    func testPre1970StatTimestampsDecodeWithoutTrapping() {
+        var st = smb2_stat_64()
+        // libsmb2 decodes pre-1970 FILETIMEs into negative seconds stored in
+        // uint64 fields (e.g. Windows FILETIME 0 → 1601); Int() on those traps.
+        st.smb2_mtime = UInt64(bitPattern: -315_619_200) // 1960-01-01 UTC
+        st.smb2_mtime_nsec = 0
+        st.smb2_btime = UInt64(bitPattern: -1_420_156_800) // 1925-01-01 UTC
+        st.smb2_atime = st.smb2_mtime
+        st.smb2_ctime = st.smb2_mtime
+
+        var dic: [URLResourceKey: any Sendable] = [:]
+        st.populateResourceValue(&dic)
+
+        let mtime = dic[.contentModificationDateKey] as? Date
+        XCTAssertEqual(mtime?.timeIntervalSince1970 ?? 0, -315_619_200, accuracy: 1)
+        let btime = dic[.creationDateKey] as? Date
+        XCTAssertEqual(btime?.timeIntervalSince1970 ?? 0, -1_420_156_800, accuracy: 1)
     }
 }

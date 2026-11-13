@@ -115,6 +115,26 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         try await smb.connectShare(name: share, encrypted: encrypted)
     }
 
+    func testAutomaticEncryptionWhenRequired() async throws {
+        guard let requiredShare = ProcessInfo.processInfo.environment["SMB_ENCRYPTION_REQUIRED_SHARE"] else {
+            throw XCTSkip("Set SMB_ENCRYPTION_REQUIRED_SHARE to a share that requires encryption.")
+        }
+        let smb = SMB2Manager(url: server, credential: credential)!
+        let path = fileName()
+        addTeardownBlock {
+            try? await smb.removeFile(atPath: path)
+            try? await smb.disconnectShare(gracefully: true)
+        }
+
+        // The default must allow the server to require encryption.
+        try await smb.connectShare(name: requiredShare)
+        let data = Data("automatic encryption".utf8)
+        try await smb.write(data: data, toPath: path, progress: nil)
+        let contents = try await smb.contents(atPath: path)
+        XCTAssertEqual(contents, data)
+        try await smb.echo()
+    }
+
     func testShareEnum() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
 
@@ -127,9 +147,6 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         XCTAssert(hiddenShares.contains(where: { $0.name == self.share }))
         XCTAssertGreaterThanOrEqual(hiddenShares.count, shares.count)
 
-        let swiftShares = try await smb._swift_listShares()
-        XCTAssertFalse(swiftShares.isEmpty)
-        XCTAssert(swiftShares.contains(where: { $0.name == self.share }))
     }
 
     func testFileSystemAttributes() async throws {

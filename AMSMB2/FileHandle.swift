@@ -9,7 +9,6 @@
 
 import Foundation
 import SMB2
-import SMB2.Raw
 #if canImport(System)
 import System
 #else
@@ -155,7 +154,9 @@ final class SMB2FileHandle: @unchecked Sendable {
     init(fileDescriptor: smb2_file_id, on client: SMB2Client) throws {
         self.client = client
         var fileDescriptor = fileDescriptor
-        self.handle = smb2_fh_from_file_id(client.context, &fileDescriptor)
+        self.handle = try client.withThreadSafeContext { context in
+            try smb2_fh_from_file_id(context, &fileDescriptor).unwrap()
+        }
     }
 
     // This initializer does not support O_SYMLINK.
@@ -193,18 +194,60 @@ final class SMB2FileHandle: @unchecked Sendable {
     func close() throws {
         guard let handle = handle else { return }
         self.handle = nil
-        _ = try client.withThreadSafeContext { context in
-            smb2_close(context, handle)
+        // Keep close on the same async_await lifecycle as every other op; the sync
+        // smb2_close() wrapper would run its own poll loop while we hold the context lock.
+        _ = try? client.async_await { context, cbPtr -> Int32 in
+            smb2_close_async(context, handle, SMB2Client.generic_handler, cbPtr)
         }
     }
 
     func fstat() throws -> smb2_stat_64 {
-        let handle = try handle.unwrap()
-        var st = smb2_stat_64()
-        try client.async_await { context, cbPtr -> Int32 in
-            smb2_fstat_async(context, handle, &st, SMB2Client.generic_handler, cbPtr)
+        // Avoid smb2_fstat_async's unrelated compound: its callbacks share state
+        // that is freed too early when the server returns the queries out of order.
+        var st = try queryInfo(infoClass: .all) { output in
+            smb2_stat_64(fileInfo: output.assumingMemoryBound(to: smb2_file_all_info.self).pointee)
+        }
+        if st.smb2_attributes & UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            // As in libsmb2, the tag query is optional: older servers may reject
+            // this info class. An unknown reparse point retains the link fallback.
+            var tag: UInt32 = 0
+            do {
+                tag = try queryInfo(infoClass: .attributeTag) { output in
+                    output.assumingMemoryBound(to: smb2_file_attribute_tag_info.self).pointee.reparse_tag
+                }
+            } catch {
+                // A rejected optional info class may fall back; a lost connection
+                // or timeout must still fail the operation.
+                if !client.isActive || (error as? POSIXError)?.code == .ETIMEDOUT {
+                    throw error
+                }
+            }
+            st.setResourceType(reparseTag: tag)
         }
         return st
+    }
+
+    private func queryInfo<R>(
+        infoClass: InfoClass, decode: @escaping (UnsafeMutableRawPointer) throws -> R
+    ) throws -> R {
+        try client.withThreadSafeContext { _ in
+            let fileID = try smb2_get_file_id(handle.unwrap()).unwrap().pointee
+            return try client.async_await_pdu(dataHandler: { client, ptr in
+                let reply = try ptr.unwrap().assumingMemoryBound(to: smb2_query_info_reply.self).pointee
+                guard let output = reply.output_buffer else {
+                    throw POSIXError(.ioError, description: "Query info reply has no data.")
+                }
+                defer { try? client.withThreadSafeContext { smb2_free_data($0, output) } }
+                return try decode(output)
+            }) { context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
+                var req = smb2_query_info_request()
+                req.info_type = InfoType.file.rawValue
+                req.file_info_class = infoClass.rawValue
+                req.output_buffer_length = UInt32(min(65_535, client.maximumTransactionSize))
+                req.file_id = fileID
+                return smb2_cmd_query_info_async(context, &req, SMB2Client.generic_handler, cbPtr)
+            }.data
+        }
     }
     
     func setInfo<T>(_ value: T, type: InfoType = .file, infoClass: InfoClass) throws {
@@ -240,7 +283,12 @@ final class SMB2FileHandle: @unchecked Sendable {
                 tv_sec: .init(stat.smb2_ctime),
                 tv_usec: .init(stat.smb2_ctime_nsec / 1000)
             ),
-            file_attributes: attributes.rawValue
+            file_attributes: attributes.rawValue,
+            // Raw FILETIME fields are decode-only; the encoder reads the timevals.
+            creation_time_raw: 0,
+            last_access_time_raw: 0,
+            last_write_time_raw: 0,
+            change_time_raw: 0
         )
         try setInfo(bfi, infoClass: .basic)
     }
@@ -253,7 +301,9 @@ final class SMB2FileHandle: @unchecked Sendable {
     }
 
     var maxReadSize: Int {
-        (try? Int(client.withThreadSafeContext(smb2_get_max_read_size))) ?? -1
+        // 0 fallback (destroyed context) instead of -1: callers allocate buffers
+        // from this value and a negative count would trap.
+        max(0, (try? Int(client.withThreadSafeContext(smb2_get_max_read_size))) ?? 0)
     }
 
     /// This value allows softer streaming
@@ -264,9 +314,11 @@ final class SMB2FileHandle: @unchecked Sendable {
     @discardableResult
     func seek(offset: Int64, from whence: FileDescriptor.SeekOrigin) throws -> Int64 {
         let handle = try handle.unwrap()
-        let result = smb2_lseek(client.context, handle, offset, whence.rawValue, nil)
-        try POSIXError.throwIfError(result, description: client.errorString)
-        return result
+        return try client.withThreadSafeContext { context in
+            let result = smb2_lseek(context, handle, offset, whence.rawValue, nil)
+            try POSIXError.throwIfError(result, description: client.errorString)
+            return result
+        }
     }
 
     func read(length: Int = 0) throws -> Data {
@@ -275,7 +327,7 @@ final class SMB2FileHandle: @unchecked Sendable {
         )
 
         let handle = try handle.unwrap()
-        let count = length > 0 ? length : optimizedReadSize
+        let count = length > 0 ? length : max(1, optimizedReadSize)
         var buffer = Data(repeating: 0, count: count)
         let result = try buffer.withUnsafeMutableBytes { buffer in
             try client.async_await { context, cbPtr -> Int32 in
@@ -293,7 +345,7 @@ final class SMB2FileHandle: @unchecked Sendable {
         )
 
         let handle = try handle.unwrap()
-        let count = length > 0 ? length : optimizedReadSize
+        let count = length > 0 ? length : max(1, optimizedReadSize)
         var buffer = Data(repeating: 0, count: count)
         let result = try buffer.withUnsafeMutableBytes { buffer in
             try client.async_await { context, cbPtr -> Int32 in
@@ -307,7 +359,7 @@ final class SMB2FileHandle: @unchecked Sendable {
     }
 
     var maxWriteSize: Int {
-        (try? Int(client.withThreadSafeContext(smb2_get_max_write_size))) ?? -1
+        max(0, (try? Int(client.withThreadSafeContext(smb2_get_max_write_size))) ?? 0)
     }
 
     var optimizedWriteSize: Int {
@@ -353,6 +405,41 @@ final class SMB2FileHandle: @unchecked Sendable {
         let handle = try handle.unwrap()
         try client.async_await { context, cbPtr -> Int32 in
             smb2_fsync_async(context, handle, SMB2Client.generic_handler, cbPtr)
+        }
+    }
+
+    /// Requests an SMB2 server-side-copy resume key for this open file.
+    func requestResumeKey() throws -> smb2_srv_copychunk_resume_key {
+        let (_, key) = try client.async_await(
+            dataHandler: { client, ptr -> smb2_srv_copychunk_resume_key in
+                let key = try ptr.unwrap()
+                    .assumingMemoryBound(to: smb2_srv_copychunk_resume_key.self).pointee
+                try client.withThreadSafeContext { smb2_free_data($0, ptr) }
+                return key
+            }
+        ) { [handle] context, cbPtr -> Int32 in
+            guard let handle else { return -Int32(POSIXErrorCode.EIO.rawValue) }
+            return smb2_request_resume_key_async(context, handle, SMB2Client.generic_handler, cbPtr)
+        }
+        return key
+    }
+
+    /// Issues one FSCTL_SRV_COPYCHUNK request. The C side encodes the key and
+    /// chunks into the PDU synchronously, so pointer scopes only wrap the call.
+    func copyChunks(_ chunks: [smb2_srv_copychunk], resumeKey: smb2_srv_copychunk_resume_key) throws {
+        _ = try withUnsafePointer(to: resumeKey) { keyPtr in
+            try chunks.withUnsafeBufferPointer { buffer in
+                try client.async_await(dataHandler: { client, ptr in
+                    try client.withThreadSafeContext { smb2_free_data($0, ptr) }
+                }) { [handle] context, cbPtr -> Int32 in
+                    guard let handle else { return -Int32(POSIXErrorCode.EIO.rawValue) }
+                    return smb2_copychunk_async(
+                        context, UInt32(SMB2_FSCTL_SRV_COPYCHUNK), keyPtr, handle,
+                        buffer.baseAddress, UInt32(chunks.count),
+                        SMB2Client.generic_handler, cbPtr
+                    )
+                }
+            }
         }
     }
     
@@ -803,6 +890,52 @@ extension RawRepresentable where RawValue: BinaryInteger {
 }
 
 extension smb2_stat_64 {
+    init(fileInfo info: smb2_file_all_info) {
+        self.init()
+        smb2_attributes = info.basic.file_attributes
+        smb2_nlink = info.standard.number_of_links
+        smb2_ino = info.index_number
+        smb2_size = info.standard.end_of_file
+        // time_t is signed while smb2_stat_64 stores seconds in uint64 fields.
+        smb2_atime = UInt64(truncatingIfNeeded: info.basic.last_access_time.tv_sec)
+        smb2_atime_nsec = UInt64(info.basic.last_access_time.tv_usec) * 1000
+        smb2_mtime = UInt64(truncatingIfNeeded: info.basic.last_write_time.tv_sec)
+        smb2_mtime_nsec = UInt64(info.basic.last_write_time.tv_usec) * 1000
+        smb2_ctime = UInt64(truncatingIfNeeded: info.basic.change_time.tv_sec)
+        smb2_ctime_nsec = UInt64(info.basic.change_time.tv_usec) * 1000
+        smb2_btime = UInt64(truncatingIfNeeded: info.basic.creation_time.tv_sec)
+        smb2_btime_nsec = UInt64(info.basic.creation_time.tv_usec) * 1000
+        setResourceType(reparseTag: 0)
+    }
+
+    mutating func setResourceType(reparseTag: UInt32) {
+        smb2_type = smb2_attributes & UInt32(SMB2_FILE_ATTRIBUTE_DIRECTORY) != 0
+            ? UInt32(SMB2_TYPE_DIRECTORY) : UInt32(SMB2_TYPE_FILE)
+        smb2_reparse_tag = 0
+        guard smb2_attributes & UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT) != 0 else { return }
+        smb2_reparse_tag = reparseTag
+
+        // Match libsmb2's classification, including WSL special files and the
+        // name-surrogate bit for tags that are not explicitly known.
+        switch reparseTag {
+        case 0, UInt32(SMB2_REPARSE_TAG_SYMLINK), UInt32(SMB2_REPARSE_TAG_MOUNT_POINT),
+             UInt32(SMB2_REPARSE_TAG_LX_SYMLINK):
+            smb2_type = UInt32(SMB2_TYPE_LINK)
+        case UInt32(SMB2_REPARSE_TAG_LX_FIFO):
+            smb2_type = UInt32(SMB2_TYPE_FIFO)
+        case UInt32(SMB2_REPARSE_TAG_LX_CHR):
+            smb2_type = UInt32(SMB2_TYPE_CHARDEV)
+        case UInt32(SMB2_REPARSE_TAG_LX_BLK):
+            smb2_type = UInt32(SMB2_TYPE_BLOCKDEV)
+        case UInt32(SMB2_REPARSE_TAG_AF_UNIX):
+            smb2_type = UInt32(SMB2_TYPE_SOCKET)
+        default:
+            if reparseTag & UInt32(SMB2_REPARSE_TAG_NAME_SURROGATE_BIT) != 0 {
+                smb2_type = UInt32(SMB2_TYPE_LINK)
+            }
+        }
+    }
+
     struct ResourceType: RawRepresentable, Hashable, Sendable {
         var rawValue: UInt32
         
@@ -842,17 +975,20 @@ extension smb2_stat_64 {
         dic[.isRegularFileKey] = NSNumber(value: resourceType == .file)
         dic[.isSymbolicLinkKey] = NSNumber(value: resourceType == .link)
 
+        // NT timestamps decode into uint64 fields; bitPattern keeps the conversion
+        // trap-free for any server-supplied value (defensive; malformed times
+        // simply yield far-off dates).
         dic[.contentModificationDateKey] = Date(
-            timespec(tv_sec: Int(smb2_mtime), tv_nsec: Int(smb2_mtime_nsec))
+            timespec(tv_sec: Int(clamping: Int64(bitPattern: smb2_mtime)), tv_nsec: Int(smb2_mtime_nsec))
         )
         dic[.attributeModificationDateKey] = Date(
-            timespec(tv_sec: Int(smb2_ctime), tv_nsec: Int(smb2_ctime_nsec))
+            timespec(tv_sec: Int(clamping: Int64(bitPattern: smb2_ctime)), tv_nsec: Int(smb2_ctime_nsec))
         )
         dic[.contentAccessDateKey] = Date(
-            timespec(tv_sec: Int(smb2_atime), tv_nsec: Int(smb2_atime_nsec))
+            timespec(tv_sec: Int(clamping: Int64(bitPattern: smb2_atime)), tv_nsec: Int(smb2_atime_nsec))
         )
         dic[.creationDateKey] = Date(
-            timespec(tv_sec: Int(smb2_btime), tv_nsec: Int(smb2_btime_nsec))
+            timespec(tv_sec: Int(clamping: Int64(bitPattern: smb2_btime)), tv_nsec: Int(smb2_btime_nsec))
         )
     }
 }

@@ -29,7 +29,32 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     fileprivate typealias CopyProgressHandler = (@Sendable
         (_ bytes: Int64, _ soFar: Int64, _ total: Int64) -> Int64?)?
 
-    fileprivate var client: SMB2Client?
+    private let clientLock = NSLock()
+    private var _client: SMB2Client?
+    private var _clientEncrypted = false
+
+    fileprivate var client: SMB2Client? {
+        get { clientState.client }
+    }
+
+    /// Connects must record the connection's encryption alongside it:
+    /// `connectShare(name:encrypted:)` must not hand back a live
+    /// connection negotiated with a different encryption mode.
+    private func setClient(_ client: SMB2Client?, encrypted: Bool) {
+        clientLock.lock()
+        let previous = _client
+        _client = client
+        _clientEncrypted = encrypted
+        clientLock.unlock()
+        // Client destruction may acquire the context lock and perform I/O.
+        withExtendedLifetime(previous) {}
+    }
+
+    private var clientState: (client: SMB2Client?, encrypted: Bool, timeout: TimeInterval) {
+        clientLock.lock()
+        defer { clientLock.unlock() }
+        return (_client, _clientEncrypted, _timeout)
+    }
 
     /// SMB2 Share URL.
     public let url: URL
@@ -49,10 +74,14 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     /// Set this to 0 or negative value in order to disable it.
     open var timeout: TimeInterval {
         get {
-            client?.timeout ?? _timeout
+            let state = clientState
+            return state.client?.timeout ?? state.timeout
         }
         set {
+            clientLock.lock()
             _timeout = newValue
+            let client = _client
+            clientLock.unlock()
             client?.timeout = newValue
         }
     }
@@ -66,16 +95,17 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     public var customMirror: Mirror {
+        let state = clientState
         var c: [(label: String?, value: Any)] = []
 
         c.append((label: "url", value: url))
-        c.append((label: "isConnected", value: (client?.isActive ?? false)))
-        c.append((label: "timeout", value: _timeout))
+        c.append((label: "isConnected", value: (state.client?.isActive ?? false)))
+        c.append((label: "timeout", value: state.timeout))
         if _domain.isEmpty { c.append((label: "domain", value: _domain)) }
         if _workstation.isEmpty { c.append((label: "workstation", value: _workstation)) }
         if _workstation.isEmpty { c.append((label: "workstation", value: _workstation)) }
         c.append((label: "user", value: _user))
-        if let connectedShare = client?.share { c.append((label: "share", value: connectedShare)) }
+        if let connectedShare = state.client?.share { c.append((label: "share", value: connectedShare)) }
 
         let m = Mirror(self, children: c, displayStyle: .class)
         return m
@@ -191,7 +221,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     public required init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let url = try container.decode(URL.self, forKey: .url)
-        guard url.scheme?.lowercased() == "smb" else {
+        guard url.scheme?.lowercased() == "smb", url.host != nil else {
             throw DecodingError.dataCorruptedError(
                 forKey: CodingKeys.url, in: container, debugDescription: "URL is not smb."
             )
@@ -244,17 +274,21 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         with(completionHandler: completionHandler) {
             self.connectLock.lock()
             defer { self.connectLock.unlock() }
-            if self.client == nil || !self.client.unsafelyUnwrapped.isActive
-                || self.client?.share != name
+            let state = self.clientState
+            var client: SMB2Client
+            if let current = state.client, current.isActive, current.share == name,
+                state.encrypted == encrypted
             {
-                self.client = try self.connect(shareName: name, encrypted: encrypted)
+                client = current
+            } else {
+                client = try self.connect(shareName: name, encrypted: encrypted)
             }
 
             // Workaround disgraceful disconnect issue (e.g. server timeout)
             do {
-                try self.client!.echo()
+                try client.echo()
             } catch {
-                self.client = try self.connect(shareName: name, encrypted: encrypted)
+                client = try self.connect(shareName: name, encrypted: encrypted)
             }
         }
     }
@@ -288,8 +322,9 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     ) {
         q.async {
             do {
-                self.connectLock.lock()
-                defer { self.connectLock.unlock() }
+                // Wait for in-flight operations before taking connectLock: a queued
+                // connectShare holds an operation count while waiting for this lock,
+                // so taking connectLock first would deadlock the pair.
                 if gracefully {
                     self.operationLock.lock()
                     while self.operationCount > 0 {
@@ -297,8 +332,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                     }
                     self.operationLock.unlock()
                 }
+                self.connectLock.lock()
+                defer { self.connectLock.unlock() }
                 try self.client?.disconnect()
-                self.client = nil
+                self.setClient(nil, encrypted: false)
                 completionHandler?(nil)
             } catch {
                 completionHandler?(error)
@@ -378,27 +415,6 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         }
     }
 
-    /// Only for test case coverage
-    func _swift_listShares(
-        enumerateHidden: Bool = false,
-        completionHandler: @Sendable @escaping (_ result: Result<[(name: String, comment: String)], any Error>) -> Void
-    ) {
-        with(shareName: "IPC$", encrypted: false, completionHandler: completionHandler) { client in
-            try client.shareEnumSwift().map(enumerateHidden: enumerateHidden)
-        }
-    }
-
-    /// Only for test case coverage
-    func _swift_listShares(
-        enumerateHidden: Bool = false
-    ) async throws -> [(name: String, comment: String)] {
-        try await withCheckedThrowingContinuation { continuation in
-            _swift_listShares(enumerateHidden: enumerateHidden) { result in
-                continuation.resume(with: result)
-            }
-        }
-    }
-
     /**
      Enumerates directory contents in the give path.
 
@@ -455,7 +471,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             let blockSize = UInt64(stat.f_bsize)
             // NSNumber allows to cast to any number type, but it is unsafe to cast to types with lower bitwidth
             result[.systemNumber] = NSNumber(value: stat.f_fsid)
-            if stat.f_blocks < UInt64.max / blockSize {
+            // A defective server can report f_bsize == 0; guard the division.
+            if blockSize > 0, stat.f_blocks < UInt64.max / blockSize {
                 result[.systemSize] = NSNumber(value: blockSize * stat.f_blocks)
                 result[.systemFreeSize] = NSNumber(value: blockSize * stat.f_bavail)
             }
@@ -1484,18 +1501,22 @@ extension SMB2Manager {
     private func initClient(_ client: SMB2Client, encrypted: Bool) {
         client.securityMode = [.enabled]
         client.authentication = .ntlmSsp
-        client.seal = encrypted
+        // New contexts default to optional encryption. Setting seal to false now
+        // disables negotiation entirely, including shares that require encryption.
+        if encrypted {
+            client.seal = true
+        }
 
         client.domain = _domain
         client.workstation = _workstation
         client.user = _user
         client.password = _password
-        client.timeout = _timeout
+        client.timeout = clientState.timeout
     }
 
     private func connect(shareName: String, encrypted: Bool) throws -> SMB2Client {
         let client = try SMB2Client()
-        self.client = client
+        self.setClient(client, encrypted: encrypted)
         initClient(client, encrypted: encrypted)
         let server = url.host! + (url.port.map { ":\($0)" } ?? "")
         try client.connect(server: server, share: shareName, user: _user)
@@ -1567,7 +1588,7 @@ extension SMB2Manager {
         var contents = [[URLResourceKey: any Sendable]]()
         let dir = try SMB2Directory(path.trimmedPath, on: client)
         for ent in dir {
-            let name = String(cString: ent.name)
+            let name = ent.name
             if [".", ".."].contains(name) { continue }
             var result = [URLResourceKey: any Sendable]()
             result[.nameKey] = name
@@ -1649,28 +1670,31 @@ extension SMB2Manager {
     ) throws -> Int64? {
         let fileSource = try SMB2FileHandle(forReadingAtPath: path, on: client)
         let size = try Int64(fileSource.fstat().smb2_size)
-        let sourceKey: IOCtl.RequestResumeKey = try fileSource.fcntl(command: .srvRequestResumeKey)
-        // TODO: Get chunk size from server
-        let chunkSize = fileSource.optimizedWriteSize
-        let chunkArray = stride(from: 0, to: UInt64(size), by: chunkSize).map {
-            IOCtl.SrvCopyChunk(
-                sourceOffset: $0, targetOffset: $0,
-                length: min(UInt32(UInt64(size) - $0), UInt32(chunkSize))
-            )
-        }
+        let sourceKey = try fileSource.requestResumeKey()
+        // MS-SMB2 caps a single SRV_COPYCHUNK at 1 MiB regardless of the
+        // negotiated write size.
+        let chunkSize = min(max(1, fileSource.optimizedWriteSize), 1_048_576)
         let fileDest = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
         var shouldContinue = true
-        for chunk in chunkArray {
-            let chunkCopy = IOCtl.SrvCopyChunkCopy(sourceKey: sourceKey.resumeKey, chunks: [chunk])
-            try fileDest.fcntl(command: .srvCopyChunk, args: chunkCopy)
+        var offset: UInt64 = 0
+        while offset < UInt64(size) {
+            // Compute the per-chunk length in UInt64 before narrowing: converting
+            // size itself to UInt32 traps for files larger than 4 GiB.
+            let length = UInt32(min(UInt64(chunkSize), UInt64(size) - offset))
+            try fileDest.copyChunks(
+                [smb2_srv_copychunk(
+                    source_offset: offset, target_offset: offset, length: length, reserved: 0
+                )],
+                resumeKey: sourceKey
+            )
             if let progress {
-                shouldContinue =
-                    progress(Int64(chunk.length), Int64(chunk.sourceOffset) + Int64(chunk.length), size) != nil
+                shouldContinue = progress(Int64(length), Int64(offset) + Int64(length), size) != nil
             }
-            
+
             if !shouldContinue {
                 break
             }
+            offset += UInt64(length)
         }
         return shouldContinue ? size : nil
     }
@@ -1768,7 +1792,7 @@ extension SMB2Manager {
         } else {
             file = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
         }
-        let chunkSize = chunkSize > 0 ? chunkSize : file.optimizedWriteSize
+        let chunkSize = chunkSize > 0 ? chunkSize : max(1, file.optimizedWriteSize)
         var totalWritten: UInt64 = 0
 
         try stream.withOpenStream {
