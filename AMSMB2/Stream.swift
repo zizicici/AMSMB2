@@ -186,10 +186,17 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
                     self.buffer.removeAll()
                     bufferOffset = 0
                     if isProducerFinished {
-                        status = .atEnd
+                        // Draining after the producer ended decides the
+                        // terminal state: an error must surface through the
+                        // next read, never decay into EOF.
+                        if let error = producerError {
+                            theError = error
+                            status = .error
+                        } else {
+                            status = .atEnd
+                        }
                     }
                 }
-                condition.broadcast() // buffer space freed for the producer
                 return count
             }
 
@@ -220,7 +227,12 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
     private func prefetchHasSpace(for count: Int) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        return buffer.count - bufferOffset + count <= highWaterMark
+        let buffered = buffer.count - bufferOffset
+        // An empty buffer always accepts, even an oversized chunk: a single
+        // element larger than the mark would otherwise wait for space that
+        // can never free up (the consumer cannot drain what was never
+        // buffered) and deadlock the stream.
+        return buffered == 0 || buffered + count <= highWaterMark
     }
 
     private func prefetchIsClosed() -> Bool {

@@ -23,6 +23,8 @@ jobs:
       with:
         swift-version: ${{ matrix.swift }}
     - uses: actions/checkout@v3
+      with:
+        submodules: recursive
     - name: Get swift version
       run: swift --version
     - name: Build

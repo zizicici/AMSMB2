@@ -178,8 +178,11 @@ final class SMB2LifetimeTests: XCTestCase {
                 XCTAssertEqual(request.number(at: 12, UInt16.self), UInt16(command.rawValue))
                 var body = Data(repeating: 0, count: 8)
                 body.put(UInt16(89), at: 0) // create reply structure size
-                body[2] = 80
-                body.put(UInt32(100), at: 4)
+                body[2] = 0 // oplock level
+                body.put(UInt32(1), at: 4) // FILE_OPENED
+                // None of the body fields are ever parsed: the fixed section
+                // needs 88 bytes and only 8 arrive, so the reply stalls in
+                // SMB2_RECV_FIXED and the CREATE PDU becomes smb2->pdu.
                 let header = response(for: request) + body
                 var length = UInt32(header.count + 100).bigEndian
                 try sendAll(peer, withUnsafeBytes(of: &length) { Data($0) } + header)

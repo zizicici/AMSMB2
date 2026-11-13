@@ -452,8 +452,12 @@ extension SMB2Client {
                 // The reply may have been processed just before the connection
                 // failed; the call itself completed, so keep its result — the
                 // failure surfaces on the next operation, like libsmb2's own
-                // synchronous wait loop.
-                if cb.isFinished { break }
+                // synchronous wait loop. A callback that only completed via
+                // the fd guard during teardown records a bare -1 placeholder
+                // (errno-shaped, no information about this operation); surface
+                // the connection failure with its description instead of
+                // letting it degrade to a meaningless EPERM.
+                if cb.isFinished, cb.result != -1 { break }
                 throw error
             }
         }
@@ -463,7 +467,7 @@ extension SMB2Client {
         guard let cbdata else { return }
         let callbackData = Unmanaged<CBData>.fromOpaque(cbdata).takeRetainedValue()
         do {
-            guard try smb2.unwrap().pointee.fd > 0 else {
+            guard try smb2.unwrap().pointee.fd >= 0 else {
                 // Connect-stage failures and context teardown close the socket before
                 // invoking us; record the status instead of swallowing it as success.
                 callbackData.result = status

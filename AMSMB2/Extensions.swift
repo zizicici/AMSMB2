@@ -193,6 +193,12 @@ struct SMB2Timestamp: Equatable, Sendable {
     /// wrapping: its encoder computes `seconds × 10⁷ + 116444736000000000`
     /// in uint64 arithmetic, so keep one second of slack for the sub-second
     /// part and reject anything beyond.
+    ///
+    /// Note this bounds what fits in the wire type, not what a server
+    /// accepts: a FILETIME at or above 2⁶³ (seconds ≥ 910_692_730_085, about
+    /// the year 30828) is a negative `LARGE_INTEGER` under Windows semantics
+    /// and is typically rejected with `STATUS_INVALID_PARAMETER` rather than
+    /// stored. Dates between that and this bound are sent and fail remotely.
     static let maxEncodableSeconds: UInt64 = (UInt64.max - 116_444_736_000_000_000) / 10_000_000 - 1
 
     let seconds: UInt64

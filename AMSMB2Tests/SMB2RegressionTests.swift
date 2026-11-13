@@ -14,6 +14,11 @@ import Darwin
 #else
 import Glibc
 #endif
+#if canImport(System)
+import System
+#else
+import SystemPackage
+#endif
 @testable import AMSMB2
 import SMB2
 
@@ -62,7 +67,7 @@ final class SMB2RegressionTests: XCTestCase {
         let base = AsyncStream<Data> { continuation in
             continuation.yield(Data([1, 2, 3]))
             Task {
-                try? await Task.sleep(nanoseconds: 300_000_000)
+                try? await Task.sleep(nanoseconds: 800_000_000)
                 continuation.yield(Data([4, 5, 6]))
                 continuation.finish()
             }
@@ -73,29 +78,72 @@ final class SMB2RegressionTests: XCTestCase {
         var buffer = [UInt8](repeating: 0, count: 16)
         XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), 3)
         XCTAssertEqual(stream.streamStatus, .open, "a drained buffer is not EOF while the producer can still yield")
-        Thread.sleep(forTimeInterval: 0.6) // second chunk arrives and the sequence finishes
+        Thread.sleep(forTimeInterval: 1.0) // second chunk arrives and the sequence finishes
         XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), 3)
         XCTAssertEqual(Array(buffer.prefix(3)), [4, 5, 6])
         XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), 0)
     }
 
-    func test_AsyncInputStreamPropagatesProducerError() {
-        let base = AsyncThrowingStream<Data, any Error> { continuation in
-            continuation.yield(Data([1, 2, 3]))
-            Task {
-                try? await Task.sleep(nanoseconds: 200_000_000)
-                continuation.finish(throwing: POSIXError(.EIO))
-            }
-        }
+    func test_AsyncInputStreamPropagatesProducerErrorAfterDrain() {
+        // Deterministic ordering: the first chunk is read out before the
+        // producer is failed, so the failure can only surface on the next
+        // read.
+        let (base, producer) = AsyncThrowingStream<Data, any Error>.makeStream()
         let stream = AsyncInputStream(stream: base)
         stream.open()
-        Thread.sleep(forTimeInterval: 0.2)
+        producer.yield(Data([1, 2, 3]))
+        while !stream.hasBytesAvailable {}
         var buffer = [UInt8](repeating: 0, count: 16)
         XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), 3, "buffered data stays readable before the error")
+        producer.finish(throwing: POSIXError(.EIO))
         // Blocks until the producer failure surfaces, then reports it.
         XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), -1)
         XCTAssertEqual(stream.streamStatus, .error)
         XCTAssertNotNil(stream.streamError)
+    }
+
+    func test_AsyncInputStreamErrorBeforeDrainIsNotEOF() {
+        // The producer fails before the buffered chunk is consumed: draining
+        // the buffer must not decay the stream into EOF and swallow the error.
+        let (base, producer) = AsyncThrowingStream<Data, any Error>.makeStream()
+        let stream = AsyncInputStream(stream: base)
+        stream.open()
+        producer.yield(Data([1, 2, 3]))
+        producer.finish(throwing: POSIXError(.EIO))
+        Thread.sleep(forTimeInterval: 0.2) // both the chunk and the failure are recorded
+        var buffer = [UInt8](repeating: 0, count: 16)
+        XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), 3, "buffered data is still delivered")
+        XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), -1, "the failure surfaces after the buffer drains")
+        XCTAssertEqual(stream.streamStatus, .error)
+        XCTAssertNotNil(stream.streamError)
+    }
+
+    func test_AsyncInputStreamAcceptsOversizedChunk() {
+        // A single element larger than the prefetch high-water mark must not
+        // deadlock the stream waiting for space that can never free up.
+        let oversized = 5 << 20
+        let base = AsyncStream<Data> { continuation in
+            continuation.yield(Data(repeating: 0x41, count: oversized))
+            continuation.finish()
+        }
+        let stream = AsyncInputStream(stream: base)
+        stream.open()
+        let finished = expectation(description: "oversized chunk fully read")
+        DispatchQueue.global().async {
+            defer { finished.fulfill() }
+            var total = 0
+            var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+            while true {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                if count <= 0 {
+                    XCTAssertEqual(count, 0, "expected EOF, got an error")
+                    break
+                }
+                total += count
+            }
+            XCTAssertEqual(total, oversized)
+        }
+        wait(for: [finished], timeout: 10)
     }
 
     func test_AsyncInputStreamCloseInterruptsBlockedRead() {
@@ -209,6 +257,103 @@ final class SMB2RegressionTests: XCTestCase {
             XCTAssertEqual((error as? POSIXError)?.code, .ETIMEDOUT)
         }
         XCTAssertFalse(client.isActive, "the monitor's PDU timeout tears down the whole connection")
+    }
+
+    // MARK: a pending request on a dropped connection reports ENOTCONN, not a bare EPERM
+
+    func test_ReadThrowsNotConnectedWhenSocketDropsWithoutReply() throws {
+        let (client, peer) = try makeClient()
+        let finished = expectation(description: "Closing peer finished")
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            do {
+                _ = try receivePacket(peer) // the READ request itself
+                // No reply at all: the socket just dies while the request is
+                // in flight (the common disconnect scenario).
+            } catch {
+                XCTFail("Closing peer: \(error)")
+            }
+        }
+        defer {
+            client.destroyContext()
+            wait(for: [finished], timeout: 10)
+        }
+        let file = try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client)
+        XCTAssertThrowsError(try file.read(length: 64)) { error in
+            XCTAssertEqual(
+                (error as? POSIXError)?.code,
+                .ENOTCONN,
+                "teardown of a still-pending request must surface the connection failure, not a placeholder EPERM"
+            )
+        }
+        XCTAssertFalse(client.isActive)
+    }
+
+    // MARK: fd 0 is a valid socket
+
+    func test_FileDescriptorZeroIsValidSocket() {
+        XCTAssertTrue(FileDescriptor(rawValue: 0).isValidSocket)
+        XCTAssertFalse(FileDescriptor.invalid.isValidSocket)
+    }
+
+    // MARK: notify chain is traversed exactly once per entry and freed
+
+    func test_NotifyChainTraversalAndFree() throws {
+        let client = try SMB2Client()
+        defer { client.destroyContext() }
+
+        func makeNode(_ name: String, action: UInt32)
+            -> UnsafeMutablePointer<smb2_file_notify_change_information>
+        {
+            let node = UnsafeMutablePointer<smb2_file_notify_change_information>.allocate(capacity: 1)
+            let cString = name.utf8CString
+            let nameBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: cString.count)
+            cString.withUnsafeBufferPointer { source in
+                nameBuffer.update(from: source.baseAddress!, count: source.count)
+            }
+            node.initialize(to: smb2_file_notify_change_information(action: action, name: nameBuffer, next: nil))
+            return node
+        }
+
+        // three linked entries
+        let first = makeNode("first", action: 3)
+        let second = makeNode("second", action: 2)
+        let third = makeNode("third", action: 1)
+        first.pointee.next = second
+        second.pointee.next = third
+
+        // The initializer takes ownership of the chain and frees it via
+        // free_smb2_file_notify_change_information(); do not touch it after.
+        let changes = try [SMB2FileChangeInfo](client, first)
+        // Exactly one entry per node: the old loop duplicated the first and
+        // dropped the last.
+        XCTAssertEqual(changes.count, 3)
+        XCTAssertEqual(changes[0].fileName, "first")
+        XCTAssertEqual(changes[0].action.rawValue, 3)
+        XCTAssertEqual(changes[1].fileName, "second")
+        XCTAssertEqual(changes[2].fileName, "third")
+    }
+
+    // MARK: queue-time encryption abort completes the compound immediately
+
+    func test_StatWithSealButNoKeyFailsFast() throws {
+        // With seal negotiated but no session key, smb2_queue_pdu() fails to
+        // encrypt and aborts the whole compound before it is sent. The
+        // members' callbacks must fire at once (libsmb2 fork commit
+        // "complete compound state on queue-time aborts") instead of leaving
+        // the caller to time out.
+        let client = try SMB2Client()
+        defer { client.destroyContext() }
+        try client.withThreadSafeContext { context in
+            context.pointee.seal = 1
+            context.pointee.fd = -1
+        }
+        client.timeout = 5
+        let started = Date()
+        XCTAssertThrowsError(try client.stat("file")) { error in
+            print("seal-abort stat error:", error)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3, "must fail immediately, not via the timeout backstop")
     }
 }
 

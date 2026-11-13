@@ -46,62 +46,6 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         // Put teardown code here. This method is called after the invocation of each test method in the class.
         super.tearDown()
     }
-    
-    @available(iOS 11.0, macOS 10.13, tvOS 11.0, *)
-    func testNSCodable() {
-        let url = URL(string: "smb://192.168.1.1/share")!
-        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
-        let smb = SMB2Manager(url: url, credential: credential)
-        XCTAssertNotNil(smb)
-        let archiver = NSKeyedArchiver(requiringSecureCoding: true)
-        archiver.encode(smb, forKey: NSKeyedArchiveRootObjectKey)
-        archiver.finishEncoding()
-        let data = archiver.encodedData
-        XCTAssertNil(archiver.error)
-        XCTAssertFalse(data.isEmpty)
-        let unarchiver = try! NSKeyedUnarchiver(forReadingFrom: data)
-        unarchiver.decodingFailurePolicy = .setErrorAndReturn
-        unarchiver.requiresSecureCoding = true
-        let decodedSMB = unarchiver.decodeObject(
-            of: SMB2Manager.self, forKey: NSKeyedArchiveRootObjectKey
-        )
-        XCTAssertNotNil(decodedSMB)
-        XCTAssertEqual(smb?.url, decodedSMB?.url)
-        XCTAssertEqual(smb?.timeout, decodedSMB?.timeout)
-        XCTAssertNil(unarchiver.error)
-    }
-
-    func testCoding() {
-        let url = URL(string: "smb://192.168.1.1/share")!
-        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
-        let smb = SMB2Manager(url: url, domain: "", credential: credential)
-        XCTAssertNotNil(smb)
-        do {
-            let encoder = JSONEncoder()
-            let json = try encoder.encode(smb!)
-            XCTAssertFalse(json.isEmpty)
-            let decoder = JSONDecoder()
-            let decodedSMB = try decoder.decode(SMB2Manager.self, from: json)
-            XCTAssertEqual(smb!.url, decodedSMB.url)
-            XCTAssertEqual(smb!.timeout, decodedSMB.timeout)
-
-            let errorJson = String(data: json, encoding: .utf8)!.replacingOccurrences(
-                of: "smb:", with: "smb2:"
-            ).data(using: .utf8)!
-            XCTAssertThrowsError(try decoder.decode(SMB2Manager.self, from: errorJson))
-        } catch {
-            XCTAssert(false, error.localizedDescription)
-        }
-    }
-
-    func testNSCopy() {
-        let url = URL(string: "smb://192.168.1.1/share")!
-        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
-        let smb = SMB2Manager(url: url, domain: "", credential: credential)!
-        let smbCopy = smb.copy() as! SMB2Manager
-        XCTAssertEqual(smb.url, smbCopy.url)
-    }
-
     // Change server address and testing share
     lazy var server: URL = .init(string: ProcessInfo.processInfo.environment["SMB_SERVER"]!)!
 
@@ -733,5 +677,64 @@ extension SMB2ManagerTests {
 #else
         return 0
 #endif
+    }
+}
+
+/// NSCoding / Codable / NSCopy coverage that does not need a live SMB server,
+/// kept out of SMB2ManagerTests so its server-skip guard does not hide it.
+final class SMB2ManagerCodingTests: XCTestCase {
+    @available(iOS 11.0, macOS 10.13, tvOS 11.0, *)
+    func testNSCodable() {
+        let url = URL(string: "smb://192.168.1.1/share")!
+        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
+        let smb = SMB2Manager(url: url, credential: credential)
+        XCTAssertNotNil(smb)
+        let archiver = NSKeyedArchiver(requiringSecureCoding: true)
+        archiver.encode(smb, forKey: NSKeyedArchiveRootObjectKey)
+        archiver.finishEncoding()
+        let data = archiver.encodedData
+        XCTAssertNil(archiver.error)
+        XCTAssertFalse(data.isEmpty)
+        let unarchiver = try! NSKeyedUnarchiver(forReadingFrom: data)
+        unarchiver.decodingFailurePolicy = .setErrorAndReturn
+        unarchiver.requiresSecureCoding = true
+        let decodedSMB = unarchiver.decodeObject(
+            of: SMB2Manager.self, forKey: NSKeyedArchiveRootObjectKey
+        )
+        XCTAssertNotNil(decodedSMB)
+        XCTAssertEqual(smb?.url, decodedSMB?.url)
+        XCTAssertEqual(smb?.timeout, decodedSMB?.timeout)
+        XCTAssertNil(unarchiver.error)
+    }
+
+    func testCoding() {
+        let url = URL(string: "smb://192.168.1.1/share")!
+        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
+        let smb = SMB2Manager(url: url, domain: "", credential: credential)
+        XCTAssertNotNil(smb)
+        do {
+            let encoder = JSONEncoder()
+            let json = try encoder.encode(smb!)
+            XCTAssertFalse(json.isEmpty)
+            let decoder = JSONDecoder()
+            let decodedSMB = try decoder.decode(SMB2Manager.self, from: json)
+            XCTAssertEqual(smb!.url, decodedSMB.url)
+            XCTAssertEqual(smb!.timeout, decodedSMB.timeout)
+
+            let errorJson = String(data: json, encoding: .utf8)!.replacingOccurrences(
+                of: "smb:", with: "smb2:"
+            ).data(using: .utf8)!
+            XCTAssertThrowsError(try decoder.decode(SMB2Manager.self, from: errorJson))
+        } catch {
+            XCTAssert(false, error.localizedDescription)
+        }
+    }
+
+    func testNSCopy() {
+        let url = URL(string: "smb://192.168.1.1/share")!
+        let credential = URLCredential(user: "user", password: "password", persistence: .forSession)
+        let smb = SMB2Manager(url: url, domain: "", credential: credential)!
+        let smbCopy = smb.copy() as! SMB2Manager
+        XCTAssertEqual(smb.url, smbCopy.url)
     }
 }

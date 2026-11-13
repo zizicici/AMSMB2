@@ -58,17 +58,17 @@ extension Array where Element == SMB2FileChangeInfo {
                 )
             }
         }
-        dataPtr.withMemoryRebound(to: smb2_file_notify_change_information.self, capacity: 1) { ptr in
-            var ptr = ptr
-            if ptr.pointee.name != nil {
-                result.append(.init(ptr.pointee))
-            }
-
-            while ptr.pointee.next != nil {
-                if ptr.pointee.name != nil {
-                    result.append(.init(ptr.pointee))
+        dataPtr.withMemoryRebound(to: smb2_file_notify_change_information.self, capacity: 1) { head in
+            // Walk node by node: appending the current node and then
+            // advancing (appending the head before the loop and the node
+            // before its successor inside it duplicated the first entry and
+            // dropped the last).
+            var current: UnsafeMutablePointer<smb2_file_notify_change_information>? = head
+            while let node = current {
+                if node.pointee.name != nil {
+                    result.append(.init(node.pointee))
                 }
-                ptr = ptr.pointee.next
+                current = node.pointee.next
             }
         }
         self = result
