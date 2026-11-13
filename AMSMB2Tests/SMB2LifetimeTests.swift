@@ -123,6 +123,86 @@ final class SMB2LifetimeTests: XCTestCase {
         XCTAssertThrowsError(try client.withThreadSafeContext { _ in })
     }
 
+    func testStatCompoundPartialReplyTimeoutAbortsAllMembersCleanly() throws {
+        try checkCompoundPartialReplyTimeout(
+            description: "Partial stat peer finished",
+            command: SMB2_CREATE
+        ) { client in
+            try client.stat("file")
+        }
+    }
+
+    func testRenameCompoundPartialReplyTimeoutAbortsAllMembersCleanly() throws {
+        try checkCompoundPartialReplyTimeout(
+            description: "Partial rename peer finished",
+            command: SMB2_CREATE
+        ) { client in
+            try client.rename("old", to: "new")
+        }
+    }
+
+    func testTruncateCompoundPartialReplyTimeoutAbortsAllMembersCleanly() throws {
+        try checkCompoundPartialReplyTimeout(
+            description: "Partial truncate peer finished",
+            command: SMB2_CREATE
+        ) { client in
+            try client.resize("file", to: 1_024)
+        }
+    }
+
+    func testReadlinkCompoundPartialReplyTimeoutAbortsAllMembersCleanly() throws {
+        try checkCompoundPartialReplyTimeout(
+            description: "Partial readlink peer finished",
+            command: SMB2_CREATE
+        ) { client in
+            try client.readlink("link")
+        }
+    }
+
+    /// stat/rename/truncate/readlink are all CREATE-led compounds sharing one
+    /// C-side callback state between their members. A half-received CREATE
+    /// reply leaves the later members queued; the PDU timeout fires them while
+    /// the CREATE reply is still in flight, so the shared state must survive
+    /// every firing order and complete the user callback exactly once.
+    private func checkCompoundPartialReplyTimeout(
+        description: String,
+        command: smb2_command,
+        operation: @escaping (SMB2Client) throws -> Void
+    ) throws {
+        let (client, peer) = try makeClient()
+        let finished = expectation(description: description)
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            do {
+                let request = try receivePacket(peer)
+                XCTAssertEqual(request.number(at: 12, UInt16.self), UInt16(command.rawValue))
+                var body = Data(repeating: 0, count: 8)
+                body.put(UInt16(89), at: 0) // create reply structure size
+                body[2] = 80
+                body.put(UInt32(100), at: 4)
+                let header = response(for: request) + body
+                var length = UInt32(header.count + 100).bigEndian
+                try sendAll(peer, withUnsafeBytes(of: &length) { Data($0) } + header)
+                // Stall: the CREATE reply never completes. The remaining
+                // compound members must be timed out and the context torn down
+                // without firing any callback into freed compound state.
+                var byte: UInt8 = 0
+                XCTAssertEqual(recv(peer, &byte, 1, 0), 0, "Client must close the timed out connection")
+            } catch {
+                XCTFail("Compound peer: \(error)")
+            }
+        }
+        defer {
+            client.destroyContext()
+            wait(for: [finished], timeout: 10)
+        }
+        XCTAssertThrowsError(try operation(client)) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .ETIMEDOUT)
+        }
+        XCTAssertFalse(client.isActive)
+        XCTAssertThrowsError(try client.withThreadSafeContext { _ in })
+    }
+
     func testContextGettersAndSettersDuringConnectionFailure() throws {
         for _ in 0..<12 {
             let (client, peer) = try makeClient()

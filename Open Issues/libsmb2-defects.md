@@ -1,71 +1,50 @@
 # Open Issues: libsmb2 defects outside the Swift layer's control
 
 These defects live in the vendored `libsmb2` C library (`Dependencies/libsmb2`).
-They were verified against the commit checked out in this fork (see
-`Dependencies/libsmb2` submodule state) and **cannot be fixed from the Swift
-layer**; they are tracked here for a future upstream/fork patch.
+The submodule now tracks the [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
+fork so that C-side fixes can land alongside the Swift package; issues marked
+**fixed** below are already carried by the pinned submodule commit.
 
 Related Swift-side hardening that *was* applied in this repository is listed
 at the bottom.
 
 ---
 
-## 1. [P1] Compound commands share one callback state that the last callback frees — out-of-order firing is a heap-use-after-free
+## 1. ~~[P1] Compound commands share one callback state that the last callback frees~~ — FIXED in the fork
 
-**Where**
+**Fix**: `compound-cb-refcount` branch (zizicici/libsmb2). Every shared
+`*_cb_data` now carries a `pending` count equal to the number of compound
+PDUs holding it; each member callback accumulates its status and drops one
+reference on **every** exit path, and the drop that reaches zero performs the
+completion (invoke the user callback, free the state). Any firing order —
+reply order, PDU timeout or context teardown — now completes exactly once.
+The symlink failure-path cleanup unlink transfers its reference to the
+cleanup continuation.
 
-- `lib/libsmb2.c` — `struct stat_cb_data` (~line 2415) shared by
+Regression coverage: `SMB2LifetimeTests.test{Stat,Rename,Truncate,Readlink}-
+CompoundPartialReplyTimeoutAbortsAllMembersCleanly` reproduce the original
+heap-use-after-free (`getinfo_cb_1` reading freed `stat_cb_data` from
+`smb2_destroy_context`) on the pre-fix submodule under ASan and pass with the
+fix.
+
+The original defect, kept for context:
+
+- `lib/libsmb2.c` — `struct stat_cb_data` shared by
   `getinfo_cb_1` / `stat_attribute_tag_cb` / `getinfo_cb_2` / `getinfo_cb_3`,
   and the same pattern in `trunc_cb_1..3`, `new_name_cb_1..3`,
   `readlink_cb_1..3`, `symlink_cb_1..3`.
-- Firing sites: `smb2_timeout_pdus()` (`lib/pdu.c` ~1237) and
-  `smb2_destroy_context()` (`lib/init.c` ~461).
+- Firing sites: `smb2_timeout_pdus()` (`lib/pdu.c`) and
+  `smb2_destroy_context()` (`lib/init.c`).
 
-**Mechanism**
-
-The compound PDUs (CREATE → QUERY/SETINFO/IOCTL → CLOSE) each hold a pointer
-to one shared `*_cb_data`. Only the final callback (e.g. `getinfo_cb_3`)
-invokes the user callback and frees the shared state; the earlier callbacks
-unconditionally read (and conditionally write) `state->status`. That is only
-safe if the callbacks fire in chain order. Two orderings break it:
-
-1. **Half-received reply + PDU timeout.** Once a reply header matches, the PDU
-   leaves the waitqueue and becomes `smb2->pdu` (`lib/socket.c` ~854/~904).
-   If the compound response stalls mid-stream past the PDU timeout,
-   `smb2_timeout_pdus()` fires the *still-queued later siblings* — the CLOSE
-   callback runs, frees the shared state and completes the Swift callback —
-   after which teardown fires the in-flight CREATE callback into freed
-   memory. No server misbehavior is required, only a stalled connection.
-2. **Out-of-order reply rejected at teardown.** The order check
-   (`lib/socket.c` ~894) rejects a compound reply whose predecessor is still
-   queued, but only *after* `smb2->pdu` was assigned. The read failure makes
-   the Swift layer destroy the context; `smb2_destroy_context()` fires
-   `smb2->pdu`'s callback *before* the waitqueue's, so the trailing CLOSE
-   callback frees the shared state before the queued CREATE/QUERY callbacks
-   run. (Requires a protocol-violating server.)
-
-**Why the Swift layer cannot fix it**
-
-The allocation, the shared pointers and the firing order all live in C. The
-Swift wrapper can neither prevent the timeout path from firing the queued
-siblings nor change the teardown order. Avoiding the timeout teardown only
-defers the same UAF to the moment the half-received reply completes or the
-context is eventually destroyed.
-
-**Swift-reachable entry points** (all call into the affected C APIs):
-`stat()` / `attributes()` / `exists()` etc. (`smb2_stat_async`),
-`volumeFreeCapacity()`/`volumeTotalCapacity()` (`smb2_statvfs_async`),
-`readlink()` (`smb2_readlink_async`), `rename()` (`smb2_rename_async`),
-resize (`smb2_truncate_async`). `SMB2FileHandle.fstat()` already avoids the
-C compound for exactly this reason (see its comment in `FileHandle.swift`).
-
-**Suggested upstream fix** (verified in a working tree, then reverted to
-keep this repository's changes Swift-only): give each shared `*_cb_data` a
-`pending` count equal to the number of compound PDUs holding it; every
-callback drops one reference on *every* exit path and the last one frees.
-This makes any firing order safe without touching the state machine. For
-`symlink`, the failure-path cleanup unlink transfers its reference to the
-cleanup continuation.
+**Mechanism**: only the final callback invoked the user callback and freed the
+shared state; the earlier callbacks unconditionally read (and conditionally
+wrote) `state->status`, which was only safe if the callbacks fired in chain
+order. A half-received compound reply plus a PDU timeout fired the
+still-queued siblings — the CLOSE callback ran, freed the shared state and
+completed the Swift callback — after which teardown fired the in-flight
+CREATE callback into freed memory. No server misbehavior was required, only a
+stalled connection. `SMB2FileHandle.fstat()` additionally avoids the C
+compound on the Swift side (see its comment in `FileHandle.swift`).
 
 ---
 
@@ -103,18 +82,16 @@ the documented upstream behavior.
 
 ---
 
-## 3. [P3] `smb2_timeout_pdus()` fires only the head callback of an unsent compound chain
+## 3. ~~[P3] `smb2_timeout_pdus()` fires only the head callback of an unsent compound chain~~ — FIXED in the fork
 
-**Where**: `lib/pdu.c` `smb2_timeout_pdus()`, outqueue branch (~1242).
+**Fix**: same `compound-cb-refcount` branch. The timeout path now walks the
+`next_compound` chain and fires every member's callback, exactly like
+`smb2_destroy_context()` already did, before freeing the chain once.
 
-An unsent compound is still `next_compound`-chained; the timeout path calls
-`pdu->cb` for the head only and then frees the whole chain. For the compound
-families above that means the shared state is leaked (the final callback
-never runs) and the user callback is never invoked. The Swift wrapper's
-`timeout + 2` backstop converts this into a `ETIMEDOUT` error, so the
-user-visible symptom is only a slower failure plus a small C-side leak.
-`smb2_destroy_context()` already walks the chain and fires every member's
-callback; the timeout path should do the same.
+The original defect, kept for context: an unsent compound was still
+`next_compound`-chained; the timeout path called `pdu->cb` for the head only
+and then freed the whole chain, so the shared state was leaked and the user
+callback was never invoked.
 
 ---
 
@@ -126,13 +103,7 @@ callback; the timeout path should do the same.
   closes the directory there), so a mid-listing disconnect throws instead
   of silently returning a partial listing. Note: the underlying C
   `smb2dir` can still leak in that failure path — that is issue 2.
-
-## Exposure note
-
-The `wait_for_reply()` PDU-timeout teardown added in this branch (calling
-`smb2_timeout_pdus()` and destroying the context on completion) is what
-makes issues 1 and 3 reachable in practice; before it, the client-side
-event loop never invoked `smb2_timeout_pdus()`. If issue 1 needs to be
-neutralized before an upstream fix lands, removing that teardown (and
-keeping only the `timeout + 2` backstop) is the available Swift-side lever,
-at the cost of the stricter per-PDU timeout semantics.
+- The `wait_for_reply()` PDU-timeout teardown (calling `smb2_timeout_pdus()`
+  and destroying the context on completion) is safe to keep now that issues 1
+  and 3 are fixed in the pinned submodule; it is what guarantees late reply
+  bodies never reach Swift buffers that already left scope.
