@@ -42,14 +42,28 @@ extension Array where Element == SMB2Share {
 }
 
 extension Array where Element == SMB2FileChangeInfo {
-    init(_: SMB2Client, _ dataPtr: UnsafeMutableRawPointer?) throws {
+    init(_ client: SMB2Client, _ dataPtr: UnsafeMutableRawPointer?) throws {
         var result = [SMB2FileChangeInfo]()
-        dataPtr?.withMemoryRebound(to: smb2_file_notify_change_information.self, capacity: 1) { ptr in
+        guard let dataPtr else {
+            self = result
+            return
+        }
+        // The notify chain is allocated by libsmb2 for the callback and is
+        // owned by the callback receiver (its own sync wrapper frees it);
+        // release it once the entries are copied into Swift values.
+        defer {
+            try? client.withThreadSafeContext {
+                free_smb2_file_notify_change_information(
+                    $0, dataPtr.assumingMemoryBound(to: smb2_file_notify_change_information.self)
+                )
+            }
+        }
+        dataPtr.withMemoryRebound(to: smb2_file_notify_change_information.self, capacity: 1) { ptr in
             var ptr = ptr
             if ptr.pointee.name != nil {
                 result.append(.init(ptr.pointee))
             }
-            
+
             while ptr.pointee.next != nil {
                 if ptr.pointee.name != nil {
                     result.append(.init(ptr.pointee))
@@ -99,7 +113,11 @@ extension DecodableResponse {
             decodedLength = Int(reply.output_count)
         }
         let length = min(decodedLength, Int(reply.output_count))
-// Check memory validity in order to prevent crash on invalid pointers
+// Check memory validity in order to prevent crash on invalid pointers.
+// Best-effort only: msync() can also fail with ENOMEM for a buffer that ends
+// on the final page of a mapping, in which case a legitimate (but truncated)
+// response is silently replaced by empty data. That is the safe direction:
+// a bogus pointer never gets decoded.
 #if canImport(Darwin)
         let pageSize = sysconf(_SC_PAGESIZE)
         let base = UnsafeMutableRawPointer(bitPattern: (size_t(bitPattern: output) / pageSize) * pageSize)

@@ -189,6 +189,12 @@ extension Date {
 }
 
 struct SMB2Timestamp: Equatable, Sendable {
+    /// The latest whole second libsmb2 can encode as a FILETIME without
+    /// wrapping: its encoder computes `seconds × 10⁷ + 116444736000000000`
+    /// in uint64 arithmetic, so keep one second of slack for the sub-second
+    /// part and reject anything beyond.
+    static let maxEncodableSeconds: UInt64 = (UInt64.max - 116_444_736_000_000_000) / 10_000_000 - 1
+
     let seconds: UInt64
     let nanoseconds: UInt64
 
@@ -207,6 +213,9 @@ struct SMB2Timestamp: Equatable, Sendable {
         let scaledNanoseconds = (fractionalSeconds * Double(NSEC_PER_SEC)).rounded(.towardZero)
         guard let nanoseconds = UInt64(exactly: scaledNanoseconds),
               nanoseconds < UInt64(NSEC_PER_SEC) else {
+            throw Self.invalidDateError
+        }
+        guard UInt64(signedSeconds) <= Self.maxEncodableSeconds else {
             throw Self.invalidDateError
         }
 

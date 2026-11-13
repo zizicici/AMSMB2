@@ -38,6 +38,20 @@ final class SMB2TimestampTests: XCTestCase, @unchecked Sendable {
         }
     }
 
+    func testRejectsDatesBeyondFILETIMECapacity() throws {
+        // libsmb2 encodes seconds × 10⁷ + 116444736000000000 into a uint64;
+        // anything later than this bound would silently wrap on the wire.
+        let maxSeconds = SMB2Timestamp.maxEncodableSeconds
+        XCTAssertGreaterThan(maxSeconds, 1_800_000_000_000)
+
+        let boundary = try SMB2Timestamp(Date(timeIntervalSince1970: Double(maxSeconds)))
+        XCTAssertEqual(boundary.seconds, maxSeconds)
+
+        XCTAssertThrowsError(try SMB2Timestamp(Date(timeIntervalSince1970: Double(maxSeconds + 1)))) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .EINVAL)
+        }
+    }
+
     @MainActor
     func testCallbackSetAttributesRejectsEveryUnrepresentableDateKey() {
         let manager = makeManager()

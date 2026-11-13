@@ -102,14 +102,28 @@ extension AsyncThrowingStream where Element == Data, Failure == any Error {
     }
 }
 
+/// Prefetch pauses once this many bytes are buffered, so a fast producer
+/// cannot grow an AsyncInputStream's buffer without bound.
+private let asyncInputStreamHighWaterMark = 4 << 20
+
 public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: AsyncSequence, Seq.Element: DataProtocol, Seq: SendableMetatype, Seq.Element: SendableMetatype, Seq.AsyncIterator: SendableMetatype {
     private var stream: Seq
     private var iterator: Seq.AsyncIterator
-    private var buffer: Data?
+    private let condition = NSCondition()
+
+    // All guarded by `condition`. `buffer` is only ever grown by append and
+    // reset as a whole, so its indices stay zero-based; consumption is
+    // tracked with `bufferOffset` instead of re-slicing.
+    private var buffer = Data()
     private var bufferOffset = 0
-    private var _streamError: (any Error)?
-    private var _streamStatus: Stream.Status = .notOpen
-    private let bufferLock = NSLock()
+    private var isProducerFinished = false
+    private var producerError: (any Error)?
+    private var status: Stream.Status = .notOpen
+    private var theError: (any Error)?
+
+    /// Prefetch pauses once this many bytes are buffered, so a fast producer
+    /// cannot grow the buffer without bound.
+    private var highWaterMark: Int { asyncInputStreamHighWaterMark }
 
     init(stream: Seq) {
         self.stream = stream
@@ -119,74 +133,141 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
     }
 
     override public var streamStatus: Stream.Status {
-        _streamStatus
+        condition.lock()
+        defer { condition.unlock() }
+        return status
+    }
+
+    override public var streamError: (any Error)? {
+        condition.lock()
+        defer { condition.unlock() }
+        return theError
     }
 
     override public func open() {
-        _streamStatus = .open
+        condition.lock()
+        if status == .notOpen {
+            status = .open
+        }
+        condition.unlock()
     }
 
     override public func close() {
-        _streamStatus = .closed
-    }
-    
-    override public var streamError: (any Error)? {
-        _streamError
+        condition.lock()
+        status = .closed
+        condition.broadcast()
+        condition.unlock()
     }
 
     override public func read(_ buffer: UnsafeMutablePointer<UInt8>, maxLength len: Int) -> Int {
-        switch streamStatus {
-        case .notOpen, .closed, .error, .opening:
-            return -1
-        case .atEnd:
-            return 0
-        case .open, .reading, .writing:
-            break
-        @unknown default:
-            break
-        }
-        
-        bufferLock.lock()
-        defer { bufferLock.unlock() }
+        condition.lock()
+        defer { condition.unlock() }
+        guard len > 0 else { return 0 }
 
-        if self.buffer == nil || bufferOffset >= self.buffer!.count {
-            return -1
-        }
+        while true {
+            switch status {
+            case .notOpen, .opening, .closed, .error:
+                return -1
+            case .atEnd:
+                return 0
+            case .open, .reading, .writing:
+                break
+            @unknown default:
+                return -1
+            }
 
-        let bytesToCopy = min(len, self.buffer!.count - bufferOffset)
-        self.buffer!.copyBytes(to: buffer, from: bufferOffset..<(bufferOffset + bytesToCopy))
-        bufferOffset += bytesToCopy
-        
-        if bufferOffset == self.buffer!.count {
-            _streamStatus = .atEnd
-        }
+            if bufferOffset < self.buffer.count {
+                let count = min(len, self.buffer.count - bufferOffset)
+                self.buffer.withUnsafeBytes { raw in
+                    _ = memcpy(buffer, raw.baseAddress! + bufferOffset, count)
+                }
+                bufferOffset += count
+                if bufferOffset == self.buffer.count {
+                    self.buffer.removeAll()
+                    bufferOffset = 0
+                    if isProducerFinished {
+                        status = .atEnd
+                    }
+                }
+                condition.broadcast() // buffer space freed for the producer
+                return count
+            }
 
-        return bytesToCopy
+            // Buffer drained. Block until the producer delivers, finishes or
+            // fails; EOF must never be reported while the sequence can still
+            // yield.
+            if isProducerFinished {
+                if let error = producerError {
+                    theError = error
+                    status = .error
+                    return -1
+                }
+                status = .atEnd
+                return 0
+            }
+            _ = condition.wait(until: Date().addingTimeInterval(0.05))
+        }
     }
 
     override public var hasBytesAvailable: Bool {
-        bufferLock.lock()
-        defer { bufferLock.unlock() }
-        return buffer != nil && bufferOffset < buffer!.count || streamStatus == .open
+        condition.lock()
+        defer { condition.unlock() }
+        return bufferOffset < buffer.count || (!isProducerFinished && status == .open)
+    }
+
+    // Synchronous helpers so NSCondition stays out of async contexts.
+
+    private func prefetchHasSpace(for count: Int) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return buffer.count - bufferOffset + count <= highWaterMark
+    }
+
+    private func prefetchIsClosed() -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return status == .closed
+    }
+
+    /// Appends a chunk, waking a blocked reader. Returns false when the
+    /// stream was closed and the chunk is dropped.
+    private func prefetchAppend(_ chunk: Data) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        guard status != .closed else { return false }
+        buffer.append(chunk)
+        condition.broadcast()
+        return true
+    }
+
+    private func producerDidFinish(error: (any Error)?) {
+        condition.lock()
+        defer { condition.unlock() }
+        isProducerFinished = true
+        if let error {
+            producerError = error
+        }
+        condition.broadcast()
     }
 
     private func prefetchData() {
         Task { @Sendable in
-            do {
-                while let data = try await iterator.next() {
-                    bufferLock.withLock {
-                        if self.buffer == nil {
-                            self.buffer = Data(data)
-                        } else {
-                            self.buffer!.append(contentsOf: data)
-                        }
+            var iterator = self.iterator
+            while true {
+                do {
+                    guard let data = try await iterator.next() else { break }
+                    let chunk = Data(data)
+                    while !self.prefetchHasSpace(for: chunk.count) {
+                        guard !self.prefetchIsClosed() else { return }
+                        try? await Task.sleep(nanoseconds: 20_000_000)
                     }
-                }
-            } catch {
-                bufferLock.withLock {
-                    _streamStatus = .error
+                    guard self.prefetchAppend(chunk) else { return }
+                } catch {
+                    self.producerDidFinish(error: error)
+                    return
                 }
             }
+            self.producerDidFinish(error: nil)
         }
     }
 }

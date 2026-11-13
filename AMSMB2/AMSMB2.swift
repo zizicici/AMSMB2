@@ -101,9 +101,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         c.append((label: "url", value: url))
         c.append((label: "isConnected", value: (state.client?.isActive ?? false)))
         c.append((label: "timeout", value: state.timeout))
-        if _domain.isEmpty { c.append((label: "domain", value: _domain)) }
-        if _workstation.isEmpty { c.append((label: "workstation", value: _workstation)) }
-        if _workstation.isEmpty { c.append((label: "workstation", value: _workstation)) }
+        if !_domain.isEmpty { c.append((label: "domain", value: _domain)) }
+        if !_workstation.isEmpty { c.append((label: "workstation", value: _workstation)) }
         c.append((label: "user", value: _user))
         if let connectedShare = state.client?.share { c.append((label: "share", value: connectedShare)) }
 
@@ -809,7 +808,13 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             case .file, .link:
                 try client.unlink(path, type: stat.resourceType)
             default:
-                break
+                // Special files (FIFO, socket, device reparse points) cannot
+                // be deleted through the file interfaces; report it instead
+                // of silently succeeding.
+                throw POSIXError(
+                    .notSupported,
+                    description: "Removing this file type is not supported."
+                )
             }
         }
     }
@@ -1026,7 +1031,14 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         let (result, continuation) = AsyncThrowingStream<Data, any Error>.makeStream(bufferingPolicy: .unbounded)
         
         queue { [client] in
-            guard let client = client else { return }
+            guard let client = client else {
+                // Never leave the consumer awaiting a stream that cannot
+                // produce anything.
+                continuation.finish(
+                    throwing: POSIXError(.socketNotConnected, description: nil)
+                )
+                return
+            }
             var offset = range.lowerBound
             do {
                 let file = try SMB2FileHandle(forReadingAtPath: path, on: client)

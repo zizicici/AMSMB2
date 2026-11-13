@@ -26,9 +26,20 @@ private func fileName(postfix: String = "", name: String = #function) -> String 
 }
 
 class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
+    /// These tests need a live SMB server. Skip them when the environment is
+    /// not configured instead of trapping on `ProcessInfo...["SMB_SERVER"]!`,
+    /// which would abort the whole test run.
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["SMB_SERVER"] != nil,
+            "Set SMB_SERVER and SMB_SHARE (plus SMB_USER/SMB_PASSWORD as needed) to run these tests."
+        )
+    }
+
     override func setUp() {
         super.setUp()
-        // Put setup code here. This method is called before the invocation of each test method in the class.
+        // Put setup code here. This method will be called before the invocation of each test method in the class.
     }
 
     override func tearDown() {

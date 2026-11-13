@@ -17,7 +17,7 @@ import SystemPackage
 
 extension FileDescriptor {
     static var invalid: FileDescriptor { .init(rawValue: -1) }
-    var isValidSocket: Bool { rawValue > 0 }
+    var isValidSocket: Bool { rawValue >= 0 }
 }
 
 /// Provides synchronous operation on SMB2
@@ -246,6 +246,12 @@ extension SMB2Client {
             if result < 0 {
                 let description = errorString
                 destroyContext()
+                if result == -1 {
+                    // smb2_service() signals "connection failed" with a bare
+                    // -1; the reason is in the error string, not an errno.
+                    // Mapping -1 through errno would misreport EPERM.
+                    throw POSIXError(.socketNotConnected, description: description)
+                }
                 try POSIXError.throwIfError(result, description: description)
             }
         }
@@ -413,9 +419,13 @@ extension SMB2Client {
             var pfd = pollfd()
             pfd.fd = fileDescriptor.rawValue
             pfd.events = try whichEvents()
-            if pfd.fd < 0
-                || (poll(&pfd, 1, 1000) < 0 && errno != .resourceTemporarilyUnavailable
-                    && errno != .interrupted)
+            if pfd.fd < 0 {
+                // The socket is gone (e.g. closed inside libsmb2); errno is
+                // unrelated on this path, so say what actually happened.
+                throw POSIXError(.socketNotConnected, description: errorString)
+            }
+            if poll(&pfd, 1, 1000) < 0, errno != .resourceTemporarilyUnavailable,
+                errno != .interrupted
             {
                 throw POSIXError(errno, description: errorString)
             }
@@ -436,7 +446,16 @@ extension SMB2Client {
             }
             if pfd.revents == 0 { continue }
 
-            try service(revents: Int32(pfd.revents))
+            do {
+                try service(revents: Int32(pfd.revents))
+            } catch {
+                // The reply may have been processed just before the connection
+                // failed; the call itself completed, so keep its result — the
+                // failure surfaces on the next operation, like libsmb2's own
+                // synchronous wait loop.
+                if cb.isFinished { break }
+                throw error
+            }
         }
     }
 
