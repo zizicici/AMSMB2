@@ -444,8 +444,13 @@ final class SMB2RegressionTests: XCTestCase {
             XCTAssertEqual(smb2_pwrite_async(context, handle, buffer, 64, 0, noop, nil), 0)
 
             // Nothing may reach the wire on a negative balance, so both
-            // requests are still queued. out.iov[1] is the fixed request
-            // body; Length sits at offset 4 for READ and WRITE alike.
+            // requests are still queued. This locks the send gate because
+            // smb2_add_to_outqueue() flushes opportunistically at queue
+            // time: with the gate intact the flush is a no-op and the PDUs
+            // stay here; with the gate broken they are sent and the queue
+            // is empty (which is what the [] failure looks like).
+            // out.iov[1] is the fixed request body; Length sits at offset
+            // 4 for READ and WRITE alike.
             var lengths: [UInt32] = []
             var pdu = context.pointee.outqueue
             while let current = pdu {
@@ -511,6 +516,55 @@ final class SMB2RegressionTests: XCTestCase {
         XCTAssertEqual(smb2_random_bytes(&second, second.count), 0)
         XCTAssertNotEqual(first, second)
         XCTAssertNotEqual(first, [UInt8](repeating: 0, count: 32))
+    }
+
+    // MARK: the write clamp must match the encoder's non-multi-credit clamp
+
+    func test_WriteClampMatchesEncodeLayerForNonMultiCredit() throws {
+        // With dialect > 0202 but multi-credit not negotiated, the encoder
+        // truncates Write requests to 64 KiB. The pwrite-side clamp used to
+        // miss that, so the reply ceiling stayed at the full request size
+        // and a forged reply claiming (64 KiB, request] bytes silently
+        // skipped data in sequential writes (libsmb2 fork amsmb2-fork-12).
+        let (client, peer) = try makeClient() // supports_multi_credit = 0
+        // Negotiate a max write larger than the request, so only the
+        // encoder's non-multi-credit clamp (the one under test) can reduce
+        // it. With the 64 KiB default in makeClient the first size clamp
+        // would mask the mutant.
+        try client.withThreadSafeContext { $0.pointee.max_write_size = 1 << 20 }
+        let finished = expectation(description: "Forging peer finished")
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            do {
+                while true {
+                    let request = try receivePacket(peer)
+                    XCTAssertEqual(request.number(at: 12, UInt16.self), UInt16(SMB2_WRITE.rawValue))
+                    XCTAssertEqual(
+                        request.number(at: 64 + 4, UInt32.self), 65536,
+                        "wire Length is the encoder's 64 KiB clamp"
+                    )
+                    // Forged: claims 512 KiB written — more than the 64 KiB
+                    // on the wire, inside the unfixed clamp's window.
+                    var body = Data(repeating: 0, count: 16)
+                    body.put(UInt16(17), at: 0)
+                    body.put(UInt32(512 * 1024), at: 4)
+                    var reply = response(for: request) + body
+                    var length = UInt32(reply.count).bigEndian
+                    reply = withUnsafeBytes(of: &length) { Data($0) } + reply
+                    try sendAll(peer, reply)
+                }
+            } catch {
+                // The client tore the socket down after rejecting the reply.
+            }
+        }
+        defer {
+            client.destroyContext()
+            wait(for: [finished], timeout: 10)
+        }
+        let file = try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client)
+        XCTAssertThrowsError(try file.write(data: Data(repeating: 0x42, count: 1 << 20))) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .EIO)
+        }
     }
 
     // MARK: teardown sweeps handles the caller never closed
@@ -765,7 +819,7 @@ private func receiveAll(_ fd: Int32, _ count: Int) throws -> Data {
 private func receivePacket(_ fd: Int32) throws -> Data {
     let prefix = try receiveAll(fd, 4)
     let count = prefix.reduce(0) { ($0 << 8) | Int($1) }
-    guard count >= 64, count <= 65_536 else { throw POSIXError(.EIO) }
+    guard count >= 64, count <= 8 << 20 else { throw POSIXError(.EIO) }
     return try receiveAll(fd, count)
 }
 

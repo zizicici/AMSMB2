@@ -90,7 +90,7 @@ class SMBClient: @unchecked Sendable {
 
 ## License
 
-While source code shipped with project is MIT licensed, but it has static link to `libsmb2` which is `LGPL v2.1`, consequently the whole project becomes `LGPL v2.1`.
+While source code shipped with project is MIT licensed, but it links `libsmb2` which is `LGPL v2.1`, consequently the whole project becomes `LGPL v2.1`.
 
 You **must** link this library dynamically to your app if you intend to distribute your app on App Store.
 

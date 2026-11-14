@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-11`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-12`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -89,6 +89,17 @@ the regression suites assume them.
   and including `<features.h>` here would freeze the feature-test macros
   before the sources define `_GNU_SOURCE`. Also corrects a QUERY_INFO
   constant used in the query-directory bounds check (same value today).
+- `fee8b0e` — the pwrite-side reply ceiling now applies the encoder's
+  non-multi-credit 64 KiB clamp: without it a dialect-3.x connection
+  without multi-credit kept the ceiling at the full request while the
+  encoder truncated the payload, and a forged reply claiming the
+  difference silently skipped bytes in sequential writes (the residual
+  window of the `94b02ad` clamp; root cause is upstream's double clamp).
+  getrandom() now uses GRND_NONBLOCK so an unseeded CRNG at early boot
+  falls through to /dev/urandom instead of hanging the client (flags=0
+  blocks, and blocking made the urandom fallback unreachable); a
+  zero-return guard stops a broken wrapper from spinning. The BSDs
+  (OpenBSD/FreeBSD/NetBSD/DragonFly) join Darwin on arc4random_buf.
 
 ## Syncing with upstream
 
@@ -123,6 +134,12 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 - CSPRNG: `SMB2RegressionTests/test_RandomBytesComeFromAStrongSource`
   asserts `smb2_random_bytes()` reports a strong source; it fails on
   Darwin without `2078fae` and on Linux (Docker) without `bc5d2dd`.
+- Encoder-aligned write clamp:
+  `SMB2RegressionTests/test_WriteClampMatchesEncodeLayerForNonMultiCredit`
+  (mutation-checked: with the clamp removed the forged mid-window reply
+  is accepted and the expected error never comes). The getrandom flags
+  and the BSD branch have no automated test (blocking and other-BSD
+  behavior are not reachable from the test hosts).
 
 ### Known weak locks
 
@@ -144,7 +161,26 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 - Hostile-server names: a FileName containing U+0000 is truncated by
   `String(cString:)` on the Swift side, and names containing `\` are not
   escaped when joined into paths. Both are name-confusion issues with a
-  malicious server, not memory-safety ones.
+  malicious server, not memory-safety ones. The same truncation applies
+  to credentials taken from a URL (`smb://ad%00min:…` authenticates as
+  "ad"); deserialized managers also trust user/password fields over the
+  URL.
+- Credits are granted into the balance before the reply is matched to a
+  request and before the signature check, so a replayed or
+  unknown-MessageId reply funds the balance (bounded by the MAX_CREDITS
+  cap; flow-control semantics only, no memory-safety impact).
+- The SMB 3.1.1 preauth-integrity chain is fail-closed, but the closure
+  lands one PDU late: the final session-setup response is not verified
+  even when the server signed it, so the first verified PDU is the
+  tree-connect reply. Similarly, no client-side SessionId/TreeId
+  consistency check exists (signed sessions are protected by the
+  signature; plaintext sessions are inherently unprotected).
+- Once observed (round 10; not reproduced since — four fresh Samba
+  4.23.8 containers, two full suites and 60 targeted runs all pass): a
+  CLOSE carrying SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB after DELETE_ON_CLOSE
+  had removed the object returned STATUS_OBJECT_NAME_NOT_FOUND. If this
+  recurs, that flag is the first suspect — the unlink/rmdir compound
+  never consumes the attribute, so dropping it is a safe fix.
 
 - A reply whose body never completes (half-received PDU in `smb2->pdu`)
   escapes `smb2_timeout_pdus`'s queue scan; AMSMB2's `timeout + 2`

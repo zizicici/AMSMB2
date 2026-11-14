@@ -10,7 +10,6 @@ USER nonroot
 
 # Change working dir to /usr/src/app
 WORKDIR /home/nonroot/src/app
-VOLUME /home/nonroot/src/app
 
 # The C target lives in Dependencies/ (smb2-module shim + libsmb2 submodule);
 # swift-system/swift-atomics are fetched from the registry at build time.
