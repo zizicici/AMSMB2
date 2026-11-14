@@ -504,7 +504,6 @@ extension SMB2Client {
             if timeout > 0, ProcessInfo.processInfo.systemUptime - startTime > timeout + 2 {
                 throw POSIXError(.timedOut, description: nil)
             }
-            print("WAITDBG: revents=\(pfd.revents) fd=\(pfd.fd) events=\(pfd.events)")
             if pfd.revents == 0 { continue }
 
             do {
