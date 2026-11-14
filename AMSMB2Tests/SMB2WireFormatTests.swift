@@ -103,6 +103,69 @@ final class SMB2WireFormatTests: XCTestCase {
         XCTAssertEqual((Int64(-5)..<10).int64Range, 0..<10)
         XCTAssertEqual((Int64.min...Int64(-1)).int64Range, 0..<0)
         XCTAssertEqual((Int8(-5)...).int64Range, 0..<Int64.max)
+        // Negative upper bounds clamp to an empty range instead of leaking
+        // a negative lower bound into seek.
+        XCTAssertEqual((..<(Int64(-5))).int64Range, 0..<0)
+        XCTAssertEqual((...(Int64(-5))).int64Range, 0..<0)
+        XCTAssertEqual((Int64(-8)...Int64(-5)).int64Range, 0..<0)
+    }
+
+    // MARK: timeout normalization
+
+    func test_timeoutNormalization() {
+        func norm(_ v: TimeInterval) -> TimeInterval {
+            SMB2Manager.normalizedTimeout(v)
+        }
+        XCTAssertEqual(norm(.infinity), 0, "infinity disables")
+        XCTAssertEqual(norm(.nan), 0)
+        XCTAssertEqual(norm(-5), 0)
+        XCTAssertEqual(norm(0), 0)
+        XCTAssertEqual(norm(0.5), 1, "sub-second rounds up, not down to disabled")
+        XCTAssertEqual(norm(1e12), TimeInterval(Int32.max))
+        XCTAssertEqual(SMB2Client.clampedTimeout(0.5), 1)
+        XCTAssertEqual(SMB2Client.clampedTimeout(.infinity), 0)
+    }
+
+    func test_timeoutDecodersNormalize() throws {
+        // A negative timeout in a decoded payload used to reach libsmb2
+        // verbatim and stamp every PDU with an already-expired deadline.
+        let bad = #"{"url":"smb://h/s","timeout":-5}"#
+        let decoded = try JSONDecoder().decode(SMB2Manager.self, from: Data(bad.utf8))
+        XCTAssertEqual(decoded.timeout, 0)
+    }
+
+    // MARK: reparse names bounded by PathBuffer, not padding
+
+    func test_reparseNameBoundUsesPathBufferLength() throws {
+        // count=12 declares an empty PathBuffer; a name claiming 20 bytes
+        // at offset 8 used to read straight into the padding.
+        var blob = Data()
+        blob.append(value: UInt32(SMB2_REPARSE_TAG_SYMLINK))
+        blob.append(value: 12 as UInt16) // ReparseDataLength
+        blob.append(value: 0 as UInt16)
+        blob.append(value: 8 as UInt16) // substitute offset
+        blob.append(value: 20 as UInt16) // substitute length
+        blob.append(value: 0 as UInt16)
+        blob.append(value: 0 as UInt16)
+        blob.append(value: 0 as UInt32)
+        blob.append(Data(repeating: 0x41, count: 40))
+        XCTAssertThrowsError(try IOCtl.SymbolicLinkReparse(data: blob))
+
+        // count=14: PathBuffer is exactly one UTF-16 code unit ("A\0");
+        // a name of that length at offset 0 is legitimate.
+        var ok = Data()
+        ok.append(value: UInt32(SMB2_REPARSE_TAG_SYMLINK))
+        ok.append(value: 14 as UInt16) // ReparseDataLength: 12 fields + 2
+        ok.append(value: 0 as UInt16) // reserved
+        ok.append(value: 0 as UInt16) // substitute offset
+        ok.append(value: 2 as UInt16) // substitute length
+        ok.append(value: 0 as UInt16) // print offset
+        ok.append(value: 0 as UInt16) // print length
+        ok.append(value: 0 as UInt32) // flags
+        ok.append(Data([0x41, 0x00])) // PathBuffer
+        ok.append(Data(repeating: 0, count: 38)) // padding past declared length
+        let decoded = try IOCtl.SymbolicLinkReparse(data: ok)
+        XCTAssertEqual(decoded.substituteName, "A")
     }
 
     // MARK: reparse decoders reject names that live in the padding

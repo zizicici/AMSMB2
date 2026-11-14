@@ -109,6 +109,12 @@ extension AsyncThrowingStream where Element == Data, Failure == any Error {
 /// cannot grow an AsyncInputStream's buffer without bound.
 private let asyncInputStreamHighWaterMark = 4 << 20
 
+/// Erases a non-Sendable iterator for the one task that consumes it.
+private struct SendableEraser: @unchecked Sendable {
+    let value: Any
+    init(_ value: Any) { self.value = value }
+}
+
 public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: AsyncSequence, Seq.Element: DataProtocol, Seq: SendableMetatype, Seq.Element: SendableMetatype, Seq.AsyncIterator: SendableMetatype {
     private var stream: Seq
     private var iterator: Seq.AsyncIterator
@@ -250,6 +256,13 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
         condition.lock()
         defer { condition.unlock() }
         guard status != .closed else { return false }
+        // Release the consumed prefix before growing: otherwise a fast
+        // producer and a slow reader keep every byte resident until the
+        // buffer is fully drained, which for a large stream never happens.
+        if bufferOffset > 0 {
+            buffer.removeFirst(bufferOffset)
+            bufferOffset = 0
+        }
         buffer.append(chunk)
         condition.broadcast()
         return true
@@ -266,11 +279,20 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
     }
 
     private func prefetchData() {
-        Task { @Sendable in
-            var iterator = self.iterator
+        // [weak self]: a producer parked in next() forever must not pin the
+        // stream (and its residual buffer) after the consumer went away.
+        // self is re-resolved per block, so the strong reference only spans
+        // the chunk handoff, never the await.
+        // Seq.AsyncIterator is only SendableMetaatype-constrained; the
+        // unchecked cast mirrors how init() already hands the sequence to
+        // this task. The iterator is confined to this one task.
+        let capturedIterator = SendableEraser(iterator)
+        Task { @Sendable [weak self] in
+            var iterator = capturedIterator.value as! Seq.AsyncIterator
             while true {
                 do {
                     guard let data = try await iterator.next() else { break }
+                    guard let self else { return }
                     let chunk = Data(data)
                     while !self.prefetchHasSpace(for: chunk.count) {
                         guard !self.prefetchIsClosed() else { return }
@@ -278,10 +300,12 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
                     }
                     guard self.prefetchAppend(chunk) else { return }
                 } catch {
+                    guard let self else { return }
                     self.producerDidFinish(error: error)
                     return
                 }
             }
+            guard let self else { return }
             self.producerDidFinish(error: nil)
         }
     }

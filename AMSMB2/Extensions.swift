@@ -210,7 +210,11 @@ extension RangeExpression where Bound: FixedWidthInteger {
             lower = 0
             upper = Int64.max
         }
-        return min(lower, upper)..<max(lower, upper)
+        // Both bounds are non-negative by now (negative uppers clamp to an
+        // empty range instead of passing a negative bound to seek).
+        let clampedLower = max(0, lower)
+        let clampedUpper = max(clampedLower, upper)
+        return clampedLower..<clampedUpper
     }
 }
 

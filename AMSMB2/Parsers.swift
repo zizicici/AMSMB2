@@ -114,7 +114,7 @@ extension DecodableResponse {
             // the server's declared output_count.
             decodedLength = MemoryLayout<smb2_reparse_data_buffer>.stride
         default:
-            decodedLength = Int(reply.output_count)
+            decodedLength = Int(clamping: reply.output_count)
         }
         let length = min(decodedLength, Int(reply.output_count))
 // Check memory validity in order to prevent crash on invalid pointers.

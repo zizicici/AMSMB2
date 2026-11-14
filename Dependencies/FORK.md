@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-6`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-7`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -49,6 +49,13 @@ the regression suites assume them.
   heap allocation per few wire bytes.
 - merge of upstream `177a9de` — pre-1970 FILETIMEs decode to negative
   seconds, matching what the Swift decode layer already assumed.
+- `e49ce3b` — a forged Write reply claiming more bytes than were sent is
+  rejected (the count drove the file offset and caller progress);
+  negotiated MaxRead/MaxWriteSize clamp to 8 MiB (forged values became
+  caller-side buffer sizes); smb2_fh_from_file_id() tolerates a NULL
+  context again; notify errors convert NT statuses through errno (teardown
+  reported EIO, not a bogus EPERM); chains dropped by the parking budget
+  fire their callbacks with SHUTDOWN before being freed.
 
 ## Syncing with upstream
 

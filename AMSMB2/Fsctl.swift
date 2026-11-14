@@ -157,10 +157,12 @@ extension IOCtl {
             let printLen = try data.scanInt(offset: 14, as: UInt16.self).unwrap()
             let flag = try data.scanValue(offset: 16, as: UInt32.self).unwrap()
 
-            // Names must live inside the declared data (count), not the
-            // padding after it — C's decoder enforces the same.
-            guard substituteOffset + substituteLen <= count,
-                  printOffset + printLen <= count
+            // Names live in PathBuffer, which is the declared data minus
+            // the 12 bytes of offset/length fields ([MS-FSCC] 2.1.2.4) —
+            // not the padding after it.
+            guard count >= 12,
+                  substituteOffset + substituteLen <= count - 12,
+                  printOffset + printLen <= count - 12
             else { throw POSIXError(.invalidArgument, description: nil) }
             let substituteData = data.dropFirst(
                 Int(SymbolicLinkReparse.headerLength + substituteOffset)
@@ -249,9 +251,13 @@ extension IOCtl {
             let printOffset = try data.scanInt(offset: 12, as: UInt16.self).unwrap()
             let printLen = try data.scanInt(offset: 14, as: UInt16.self).unwrap()
             let count = try data.scanInt(offset: 4, as: UInt16.self).unwrap()
-            // Names must live inside the declared data, not the padding.
-            guard substituteOffset + substituteLen <= count,
-                  printOffset + printLen <= count
+            guard count + 8 <= data.count else {
+                throw POSIXError(.invalidArgument, description: nil)
+            }
+            // Mount points carry 8 bytes of fields before PathBuffer.
+            guard count >= 8,
+                  substituteOffset + substituteLen <= count - 8,
+                  printOffset + printLen <= count - 8
             else { throw POSIXError(.invalidArgument, description: nil) }
 
             let substituteData = data.dropFirst(

@@ -184,7 +184,10 @@ final class SMB2FileHandle: @unchecked Sendable {
     }
 
     deinit {
-        try? close()
+        // No network I/O here (close can block up to the timeout on the
+        // releasing thread); the handle stays tracked and is freed by the
+        // client's destroy sweep if it is never closed explicitly.
+        handle = nil
     }
 
     var fileId: UUID {
@@ -330,15 +333,22 @@ final class SMB2FileHandle: @unchecked Sendable {
         )
 
         let handle = try handle.unwrap()
-        let result = try Data(data).withUnsafeBytes { buffer in
-            try client.async_await { context, cbPtr -> Int32 in
-                smb2_write_async(
-                    context, handle, buffer.baseAddress, .init(buffer.count), SMB2Client.generic_handler, cbPtr
-                )
+        // Loop over short writes: libsmb2 caps each Write at the negotiated
+        // size and reports the accepted count.
+        var written = 0
+        try Data(data).withUnsafeBytes { buffer in
+            while written < buffer.count {
+                let base = buffer.baseAddress!.advanced(by: written)
+                let result = try client.async_await { context, cbPtr -> Int32 in
+                    smb2_write_async(
+                        context, handle, base, .init(buffer.count - written),
+                        SMB2Client.generic_handler, cbPtr
+                    )
+                }
+                written += Int(result)
             }
         }
-
-        return Int(result)
+        return written
     }
 
     func write<DataType: DataProtocol>(toAbsoluteOffset offset: UInt64, data: DataType) throws -> Int {
@@ -347,16 +357,20 @@ final class SMB2FileHandle: @unchecked Sendable {
         )
 
         let handle = try handle.unwrap()
-        let result = try Data(data).withUnsafeBytes { buffer in
-            try client.async_await { context, cbPtr -> Int32 in
-                smb2_pwrite_async(
-                    context, handle, buffer.baseAddress, .init(buffer.count), offset, SMB2Client.generic_handler,
-                    cbPtr
-                )
+        var written = 0
+        try Data(data).withUnsafeBytes { buffer in
+            while written < buffer.count {
+                let base = buffer.baseAddress!.advanced(by: written)
+                let result = try client.async_await { context, cbPtr -> Int32 in
+                    smb2_pwrite_async(
+                        context, handle, base, .init(buffer.count - written),
+                        offset + UInt64(written), SMB2Client.generic_handler, cbPtr
+                    )
+                }
+                written += Int(result)
             }
         }
-
-        return Int(result)
+        return written
     }
 
     func fsync() throws {

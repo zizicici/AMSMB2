@@ -78,20 +78,32 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     /// Set this to 0 or negative value in order to disable it.
     open var timeout: TimeInterval {
         get {
+            // A destroyed context reads as 0 ("disabled"); fall back to the
+            // configured value so encode/copy of a failed manager do not
+            // round-trip into "timeouts disabled".
             let state = clientState
-            return state.client?.timeout ?? state.timeout
+            if let client = state.client, client.isActive {
+                return client.timeout
+            }
+            return state.timeout
         }
         set {
-            // Negative values are "disable", same as zero; normalizing here
-            // keeps libsmb2 from stamping PDUs with already-expired
-            // deadlines (its check is "non-zero", not "positive").
-            let normalized = max(0, newValue)
+            // Non-finite/negative values are "disable", same as zero;
+            // normalizing here keeps libsmb2 from stamping PDUs with
+            // already-expired deadlines (its check is "non-zero", not
+            // "positive"), and the clamp keeps Int32 conversion finite.
+            let normalized = SMB2Manager.normalizedTimeout(newValue)
             clientLock.lock()
             _timeout = normalized
             let client = _client
             clientLock.unlock()
             client?.timeout = normalized
         }
+    }
+
+    static func normalizedTimeout(_ value: TimeInterval) -> TimeInterval {
+        guard value.isFinite, value > 0 else { return 0 }
+        return min(value.rounded(.up), TimeInterval(Int32.max))
     }
 
     override public var debugDescription: String {
@@ -206,7 +218,9 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         // decodeDouble returns 0 for a missing key; 0 means "timeouts
         // disabled" here, so a stripped archive would hang every operation.
         if aDecoder.containsValue(forKey: CodingKeys.timeout.stringValue) {
-            self._timeout = aDecoder.decodeDouble(forKey: CodingKeys.timeout.stringValue)
+            self._timeout = SMB2Manager.normalizedTimeout(
+                aDecoder.decodeDouble(forKey: CodingKeys.timeout.stringValue)
+            )
         } else {
             self._timeout = 60
         }
@@ -249,7 +263,9 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         self._workstation = try container.decodeIfPresent(String.self, forKey: .workstation) ?? ""
         self._user = try container.decodeIfPresent(String.self, forKey: .user) ?? ""
         self._password = try container.decodeIfPresent(String.self, forKey: .password) ?? ""
-        self._timeout = try container.decodeIfPresent(TimeInterval.self, forKey: .timeout) ?? 60
+        self._timeout = SMB2Manager.normalizedTimeout(
+            try container.decodeIfPresent(TimeInterval.self, forKey: .timeout) ?? 60
+        )
         super.init()
     }
 
@@ -1074,7 +1090,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                     if data.isEmpty {
                         break
                     }
-                    continuation.yield(data.prefix(Int(range.upperBound - offset)))
+                    continuation.yield(data.prefix(Int(clamping: range.upperBound - offset)))
                     offset += Int64(data.count)
                 }
                 continuation.finish()
@@ -1558,7 +1574,10 @@ extension SMB2Manager {
             self.setClient(client, encrypted: encrypted)
         }
         initClient(client, encrypted: encrypted)
-        let server = url.host! + (url.port.map { ":\($0)" } ?? "")
+        // IPv6 literal hosts need their brackets back: url.host strips
+        // them, and libsmb2 splits host:port on the first colon.
+        let host = url.host!.contains(":") ? "[\(url.host!)]" : url.host!
+        let server = host + (url.port.map { ":\($0)" } ?? "")
         try client.connect(server: server, share: shareName, user: _user)
         return client
     }
@@ -1837,7 +1856,10 @@ extension SMB2Manager {
         } else {
             file = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
         }
-        let chunkSize = chunkSize > 0 ? chunkSize : max(1, file.optimizedWriteSize)
+        // Cap the segment buffer: a chunk larger than the negotiated write
+        // size would be allocated in full per segment while the server only
+        // accepts negotiated-size writes anyway.
+        let chunkSize = min(chunkSize > 0 ? chunkSize : max(1, file.optimizedWriteSize), 16 << 20)
         var totalWritten: UInt64 = 0
 
         try stream.withOpenStream {
@@ -1846,14 +1868,18 @@ extension SMB2Manager {
                 if segment.isEmpty {
                     break
                 }
-                let written = try file.write(toAbsoluteOffset: UInt64(offset ?? 0) + totalWritten, data: segment)
-                if written != segment.count {
-                    throw POSIXError(
-                        .ioError, description: "Inconsistency in writing to SMB file handle."
+                // Short writes are legal: libsmb2 caps each Write at the
+                // negotiated size. Keep writing the remainder.
+                var segmentOffset = 0
+                while segmentOffset < segment.count {
+                    let written = try file.write(
+                        toAbsoluteOffset: UInt64(offset ?? 0) + totalWritten,
+                        data: segment.dropFirst(segmentOffset)
                     )
+                    segmentOffset += written
+                    totalWritten += UInt64(written)
                 }
 
-                totalWritten += UInt64(segment.count)
                 var offset = try file.seek(offset: 0, from: .current)
                 if offset > totalWritten {
                     offset = Int64(totalWritten)

@@ -37,9 +37,9 @@ final class SMB2Client: CustomReflectable, @unchecked Sendable {
     }
 
     deinit {
-        if isActive {
-            try? self.disconnect()
-        }
+        // No network I/O here: a graceful disconnect can block up to the
+        // full timeout on whatever thread drops the last reference. Any
+        // open handles are freed by the destroy sweep.
         destroyContext()
     }
 
@@ -111,9 +111,17 @@ extension SMB2Client {
         }
         set {
             try? withThreadSafeContext { context in
-                smb2_set_timeout(context, Int32(newValue))
+                smb2_set_timeout(context, SMB2Client.clampedTimeout(newValue))
             }
         }
+    }
+
+    /// Seconds clamped into libsmb2's Int32: non-finite values disable the
+    /// timeout (matching the documented "0 disables"), sub-second values
+    /// round up to one second rather than down to disabled.
+    static func clampedTimeout(_ value: TimeInterval) -> Int32 {
+        guard value.isFinite, value > 0 else { return 0 }
+        return Int32(min(value.rounded(.up), TimeInterval(Int32.max)))
     }
     
     var workstation: String {
@@ -458,10 +466,15 @@ extension SMB2Client {
                 // unrelated on this path, so say what actually happened.
                 throw POSIXError(.socketNotConnected, description: errorString)
             }
-            if poll(&pfd, 1, 1000) < 0, errno != .resourceTemporarilyUnavailable,
-                errno != .interrupted
-            {
-                throw POSIXError(errno, description: errorString)
+            let pollResult = poll(&pfd, 1, 1000)
+            if pollResult < 0 {
+                // Darwin.errno: the bare `errno` resolves to this client's
+                // NT-status property, which made the EINTR/EAGAIN check
+                // compare the wrong value since it was written.
+                let pollErrno = Errno(rawValue: Darwin.errno)
+                if pollErrno != .resourceTemporarilyUnavailable, pollErrno != .interrupted {
+                    throw POSIXError(pollErrno, description: errorString)
+                }
             }
 
             // Complete queued PDUs while caller-owned buffers are still alive.
