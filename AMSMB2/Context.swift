@@ -281,7 +281,12 @@ extension SMB2Client {
 // MARK: Connectivity
 
 extension SMB2Client {
-    func connect(server: String, share: String, user: String) throws {
+    /// Passing `nil` bridges to a NULL `const char *`, which makes
+    /// `smb2_connect_share_async` skip `smb2_set_user()` entirely: the
+    /// credentials configured on the context (including the password) stay
+    /// intact and NTLM_USER_FILE is not re-read at connect time. A non-nil
+    /// value — even an empty string — overwrites the configured username.
+    func connect(server: String, share: String, user: String?) throws {
         try async_await { context, cbPtr -> Int32 in
             smb2_connect_share_async(
                 context, server, share, user, SMB2Client.generic_handler, cbPtr
@@ -360,6 +365,7 @@ extension SMB2Client {
         let file = try SMB2FileHandle(
             path: path, .readWrite, options: [.create, .exclusiveCreate, .symlink, .sync], on: self
         )
+        defer { try? file.close() }
         let reparse = IOCtl.SymbolicLinkReparse(path: wireTarget, isRelative: !isAbsolute)
         try file.fcntl(command: .setReparsePoint, args: reparse)
     }
@@ -390,6 +396,7 @@ extension SMB2Client {
             }
         case .link:
             let file = try SMB2FileHandle(path: path, .readWrite, options: [.symlink], on: self)
+            defer { try? file.close() }
             try file.setInfo(smb2_file_disposition_info(delete_pending: 1), infoClass: .disposition)
         default:
             preconditionFailure("Not supported file type.")
@@ -497,6 +504,7 @@ extension SMB2Client {
             if timeout > 0, ProcessInfo.processInfo.systemUptime - startTime > timeout + 2 {
                 throw POSIXError(.timedOut, description: nil)
             }
+            print("WAITDBG: revents=\(pfd.revents) fd=\(pfd.fd) events=\(pfd.events)")
             if pfd.revents == 0 { continue }
 
             do {

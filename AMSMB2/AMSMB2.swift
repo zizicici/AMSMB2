@@ -23,13 +23,14 @@ import SystemPackage
 /// Completion handlers and progress closures run on an internal concurrent
 /// dispatch queue; dispatch to your own queue (e.g. the main queue) before
 /// touching UI state.
+///
+/// - Warning: The `Codable` and `NSSecureCoding` conformances serialize the
+///   password in plaintext. Do not persist encoded managers to disk or logs;
+///   use the keychain for credential storage.
 #if canImport(Darwin)
 @objc(AMSMB2Manager)
 #endif
 public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomReflectable, @unchecked Sendable {
-    // The Codable/NSSecureCoding conformances below serialize _password in
-    // plaintext. Do not persist encoded managers to disk or logs; use the
-    // keychain for credential storage.
     public typealias SimpleCompletionHandler = (@Sendable (_ error: (any Error)?) -> Void)?
     public typealias ReadProgressHandler = (@Sendable (_ bytes: Int64, _ total: Int64) -> Bool)?
     public typealias WriteProgressHandler = (@Sendable (_ bytes: Int64) -> Bool)?
@@ -78,7 +79,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     fileprivate var operationCount: Int = 0
 
     /// The timeout interval to use when doing an operation until getting response. Default value is 60 seconds.
-    /// Set this to 0 or negative value in order to disable it.
+    /// Set this to 0, a negative value, or any non-finite value in order to disable it.
+    /// Positive values are rounded up to whole seconds and clamped to `Int32.max`.
     open var timeout: TimeInterval {
         get {
             // A destroyed context reads as 0 ("disabled"); fall back to the
@@ -295,6 +297,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     /**
      Connects to a share.
 
+     - Note: Credentials always come from this manager's `url`/`credential`;
+       the `NTLM_USER_FILE` environment variable is never consulted at
+       connect time.
+
      - Parameters:
        - name: Share name to connect.
        - encrypted: Enables SMB3 encryption if `true`, it fails with error in case server does not support encryption.
@@ -327,6 +333,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     /**
      Connects to a share.
+
+     - Note: Credentials always come from this manager's `url`/`credential`;
+       the `NTLM_USER_FILE` environment variable is never consulted at
+       connect time.
 
      - Parameters:
        - name: Share name to connect.
@@ -657,12 +667,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     
     /**
      Sets the attributes of the specified file or directory.
-     
+
      - Parameters:
        - attributes: A dictionary containing as keys the attributes to set for path
             and as values the corresponding value for the attribute.
             You can set the following attributes: `creationDateKey`, `contentAccessDateKey`,
-            `contentModificationDateKey`, `attributeModificationDateKey`, `isReadableKey`,
+            `contentModificationDateKey`, `attributeModificationDateKey`,
             `isUserImmutableKey`, `isSystemImmutableKey` and `isHiddenKey`.
             You can change single attributes or any combination of attributes;
             you need not specify keys for all attributes.
@@ -1114,6 +1124,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
 
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
+
      - Parameters:
        - data: data that must be written to file. You can pass either `Data`, `[UInt8]` or `NSData` object.
        - toPath: path of file to be written.
@@ -1139,6 +1151,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      Creates and writes data to file. With reporting progress per negotiated I/O chunk.
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
 
      - Parameters:
        - data: data that must be written to file. You can pass either `Data`, `[UInt8]` or `NSData` object.
@@ -1166,6 +1180,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
          If file size is less than offset, file size will be increased to the offset first.
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
 
      - Parameters:
        - data: data that must be written to file. You can pass either `Data`, `[UInt8]` or `NSData` object.
@@ -1201,6 +1217,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
 
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
+
      - Parameters:
        - data: data that must be written to file. You can pass either `Data`, `[UInt8]` or `NSData` object.
        - toPath: path of file to be written.
@@ -1222,7 +1240,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Creates and writes input stream to file. With reporting progress per negotiated I/O chunk.
+     Creates and writes input stream to file. With reporting progress per chunk.
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
 
@@ -1231,11 +1249,13 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      - Parameters:
        - stream: input stream that provides data to be written to file.
        - toPath: path of file to be written.
-       - chunkSize: chunk size to read from the stream. The default (0) picks the connection's negotiated optimal size.
+       - chunkSize: chunk size to read from the stream. 0 (the default) picks the connection's negotiated optimal write size; values are capped at 16 MiB.
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort writing.
        - bytes: written bytes count.
        - completionHandler: closure will be run after writing is completed.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
      */
     open func write<S>(
         stream: S, toPath path: String,
@@ -1251,19 +1271,20 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Creates and writes input stream to file. With reporting progress per negotiated I/O chunk.
+     Creates and writes input stream to file. With reporting progress per chunk.
 
-     - Note: Data saved in server maybe truncated when completion handler returns error.
+     - Note: Data saved in server maybe truncated when an error is thrown.
 
      - Important: Stream will be closed eventually if is not already opened when passed.
 
      - Parameters:
        - stream: input stream that provides data to be written to file.
        - toPath: path of file to be written.
-       - chunkSize: chunk size to read from the stream. The default (0) picks the connection's negotiated optimal size.
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort writing.
        - bytes: written bytes count.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
      */
     open func write<S>(
         stream: S, toPath path: String, progress: WriteProgressHandler
@@ -1308,11 +1329,11 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Copy files to a new location. With reporting progress per negotiated I/O chunk.
+     Copy files to a new location. Server-side copy: progress is reported per copy chunk (at most 1 MiB each, per MS-SMB2's SRV_COPYCHUNK limit).
 
      - Parameters:
        - atPath: path of file to be copied from.
-       - toPath: path of new file to be copied to.
+       - toPath: path of new file to be copied to. Must not already exist.
        - recursive: copies directory structure and files if path is directory.
        - progress: reports progress of written bytes count so far and expected length of contents.
            User must return `true` if they want to continuing or `false` to abort copying.
@@ -1333,11 +1354,11 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Copy files to a new location. With reporting progress per negotiated I/O chunk.
+     Copy files to a new location. Server-side copy: progress is reported per copy chunk (at most 1 MiB each, per MS-SMB2's SRV_COPYCHUNK limit).
 
      - Parameters:
        - atPath: path of file to be copied from.
-       - toPath: path of new file to be copied to.
+       - toPath: path of new file to be copied to. Must not already exist.
        - recursive: copies directory structure and files if path is directory.
        - progress: reports progress of written bytes count so far and expected length of contents.
            User must return `true` if they want to continuing or `false` to abort copying.
@@ -1365,6 +1386,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort copying.
        - completionHandler: closure will be run after uploading is completed.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
      */
     open func uploadItem(
         at url: URL, toPath: String, progress: WriteProgressHandler,
@@ -1388,6 +1411,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort copying.
        - completionHandler: closure will be run after uploading is completed.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
      */
     open func uploadItem(
         at url: URL, toPath: String, overwrite: Bool, progress: WriteProgressHandler,
@@ -1418,6 +1443,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
        - toPath: path of new file to be uploaded to.
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort copying.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
      */
     open func uploadItem(
         at url: URL, toPath: String, progress: WriteProgressHandler
@@ -1441,6 +1468,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
        - overwrite: if `true`, an existing file at `toPath` will be truncated and replaced.
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort copying.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
      */
     open func uploadItem(
         at url: URL, toPath: String, overwrite: Bool, progress: WriteProgressHandler
@@ -1466,6 +1495,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
        - progress: reports progress of written bytes count so far and expected length of contents.
            User must return `true` if they want to continuing or `false` to abort copying.
        - completionHandler: closure will be run after uploading is completed.
+
+     - Throws: `POSIXErrorCode.EIO` if the server acknowledges a non-empty write with zero bytes written (a spin-guard, not a retryable condition).
      */
     open func downloadItem(
         atPath path: String, to url: URL, progress: ReadProgressHandler,
@@ -1587,10 +1618,12 @@ extension SMB2Manager {
         // them, and libsmb2 splits host:port on the first colon.
         let host = url.host!.contains(":") ? "[\(url.host!)]" : url.host!
         let server = host + (url.port.map { ":\($0)" } ?? "")
-        // Pass an empty user: smb2_connect_share_async re-reads
-        // NTLM_USER_FILE and would override or clear the configured
-        // credentials when that environment variable is set.
-        try client.connect(server: server, share: shareName, user: "")
+        // Pass nil so libsmb2's connect path leaves the credentials set by
+        // initClient() untouched. smb2_set_user() — which connect calls for
+        // any non-NULL user, including "" — would overwrite the configured
+        // username and re-read NTLM_USER_FILE, clearing the password when no
+        // entry matches. Credentials always come from this manager.
+        try client.connect(server: server, share: shareName, user: nil)
         return client
     }
 
@@ -1707,11 +1740,16 @@ extension SMB2Manager {
                 let itemPath = try item.path.unwrap()
                 // Trim the source root: with a trailing slash the anchored
                 // replace produced "dest" + "file" instead of "dest/file".
+                // SMB names are case-insensitive, so the root match must be
+                // too: the enumeration may return a different casing than
+                // the caller spelled the source with.
                 let sourceRoot = path.trimmedPath + "/"
                 let destRoot = toPath.trimmedPath + "/"
-                let destPath = itemPath.hasPrefix(sourceRoot)
-                    ? destRoot + itemPath.dropFirst(sourceRoot.count)
-                    : itemPath.replacingOccurrences(of: path, with: toPath, options: .anchored)
+                let destPath = itemPath.range(of: sourceRoot, options: [.anchored, .caseInsensitive])
+                    .map { destRoot + itemPath[$0.upperBound...] }
+                    ?? itemPath.replacingOccurrences(
+                        of: path, with: toPath, options: [.anchored, .caseInsensitive]
+                    )
                 if item.isDirectory {
                     try client.mkdir(destPath)
                 } else {
@@ -1876,7 +1914,14 @@ extension SMB2Manager {
         if let offset {
             try client.resize(toPath, to: .init(offset))
             file = try SMB2FileHandle(forOutputAtPath: toPath, on: client)
-            try file.seek(offset: offset, from: .start)
+            // The function-wide defer below is not registered yet; close the
+            // handle here if the seek fails so it cannot leak.
+            do {
+                try file.seek(offset: offset, from: .start)
+            } catch {
+                try? file.close()
+                throw error
+            }
         } else if overwrite {
             file = try SMB2FileHandle(forOverwritingOrCreatingAtPath: toPath, on: client)
         } else {

@@ -21,6 +21,7 @@ import SystemPackage
 import FoundationNetworking
 #endif
 @testable import AMSMB2
+import Atomics
 import SMB2
 
 final class SMB2RegressionTests: XCTestCase {
@@ -58,17 +59,17 @@ final class SMB2RegressionTests: XCTestCase {
         // Read on a bounded expectation: a regression to "never wake up"
         // must fail the test, not hang the suite.
         let readDone = expectation(description: "read returned")
-        var result = -99
+        let result = ManagedAtomic(-99)
         DispatchQueue.global().async {
             defer { readDone.fulfill() }
             var buffer = [UInt8](repeating: 0, count: 16)
             let count = stream.read(&buffer, maxLength: buffer.count)
             XCTAssertEqual(count, 3)
             XCTAssertEqual(Array(buffer.prefix(3)), [1, 2, 3])
-            result = stream.read(&buffer, maxLength: buffer.count)
+            result.store(stream.read(&buffer, maxLength: buffer.count), ordering: .relaxed)
         }
         wait(for: [readDone], timeout: 5)
-        XCTAssertEqual(result, 0, "real EOF after the producer finished")
+        XCTAssertEqual(result.load(ordering: .relaxed), 0, "real EOF after the producer finished")
     }
 
     func test_AsyncInputStreamDoesNotSignalEOFWhileProducerYields() {
@@ -289,7 +290,7 @@ final class SMB2RegressionTests: XCTestCase {
             wait(for: [finished], timeout: 10)
         }
         let file = try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client)
-        XCTAssertThrowsError(try file.read(length: 64)) { error in
+        XCTAssertThrowsError(try file.write(data: Data(repeating: 0x42, count: 64))) { error in
             XCTAssertEqual(
                 (error as? POSIXError)?.code,
                 .ENOTCONN,
@@ -297,6 +298,46 @@ final class SMB2RegressionTests: XCTestCase {
             )
         }
         XCTAssertFalse(client.isActive)
+    }
+
+    // MARK: a server that acknowledges writes with zero progress must not spin the write loop
+
+    func test_WriteThrowsWhenServerReportsZeroProgress() throws {
+        let (client, peer) = try makeClient()
+        let finished = expectation(description: "Zero-write peer finished")
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            do {
+                // Answer every WRITE with count = 0. The zero-progress guard
+                // must turn this into an error after the first reply; without
+                // it the short-write loop would re-send forever (each round
+                // trip is individually successful, so no timeout fires).
+                while true {
+                    let request = try receivePacket(peer)
+                    XCTAssertEqual(request.number(at: 12, UInt16.self), UInt16(SMB2_WRITE.rawValue))
+                    XCTAssertEqual(request.count, 64 + 112, "header + fixed body + the 64 payload bytes, exactly")
+                    // StructureSize 17 means the fixed part occupies 16 bytes
+                    // (the decoder checks (17 & 0xfffe) == body length).
+                    var body = Data(repeating: 0, count: 16)
+                    body.put(UInt16(17), at: 0) // struct_size
+                    body.put(UInt32(0), at: 4) // count: zero bytes written
+                    var reply = response(for: request) + body
+                    var length = UInt32(reply.count).bigEndian
+                    reply = withUnsafeBytes(of: &length) { Data($0) } + reply
+                    try sendAll(peer, reply)
+                }
+            } catch {
+                // The client tore the socket down after the error — done.
+            }
+        }
+        defer {
+            client.destroyContext()
+            wait(for: [finished], timeout: 10)
+        }
+        let file = try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client)
+        XCTAssertThrowsError(try file.write(data: Data(repeating: 0x42, count: 64))) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .EIO)
+        }
     }
 
     // MARK: teardown sweeps handles the caller never closed
@@ -427,14 +468,19 @@ final class SMB2RegressionTests: XCTestCase {
         client.timeout = 5
         let started = Date()
         XCTAssertThrowsError(try client.stat("file")) { error in
-            // The STATUS_SHUTDOWN in the description proves the compound
-            // members actually fired; without the fork fix the callback never
-            // runs and the caller sees a bare ENOTCONN from the dead socket.
+            // EIO + immediacy (asserted below) is the contract; without the
+            // fork fix the callback never runs, the caller sees a bare
+            // ENOTCONN from the dead socket, and the call only ends at the
+            // timeout backstop. The STATUS_SHUTDOWN text is a Darwin-only
+            // bonus: on Linux the same status surfaces through the errno
+            // description ("Input/output error") instead.
             XCTAssertEqual((error as? POSIXError)?.code, .EIO)
+            #if canImport(Darwin)
             XCTAssertTrue(
                 (error as? POSIXError)?.localizedDescription.contains("SHUTDOWN") == true,
                 "expected the teardown status in the description, got: \(error)"
             )
+            #endif
         }
         XCTAssertLessThan(Date().timeIntervalSince(started), 3, "must fail immediately, not via the timeout backstop")
     }
@@ -468,7 +514,11 @@ final class SMB2RegressionTests: XCTestCase {
         let addressSize = socklen_t(MemoryLayout<sockaddr_in>.size)
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                #if canImport(Darwin)
                 Darwin.bind(reserved, $0, addressSize)
+                #else
+                Glibc.bind(reserved, $0, addressSize)
+                #endif
             }
         }
         XCTAssertEqual(bound, 0)
@@ -512,6 +562,7 @@ private func makeClient() throws -> (SMB2Client, Int32) {
         context.pointee.credits = 32
         context.pointee.dialect = UInt16(SMB2_VERSION_0302.rawValue)
         context.pointee.max_read_size = 65_536
+        context.pointee.max_write_size = 65_536
         context.pointee.max_transact_size = 65_536
     }
     XCTAssertEqual(fcntl(sockets[0], F_SETFL, O_NONBLOCK), 0)

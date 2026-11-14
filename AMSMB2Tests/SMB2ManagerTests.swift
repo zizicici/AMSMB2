@@ -587,9 +587,90 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         try await smb.createDirectory(atPath: root)
         try await smb.createDirectory(atPath: "\(root)/subdir")
         try await smb.write(data: [0x01, 0x02, 0x03], toPath: "\(root)/file", progress: nil)
+        try await smb.write(data: [0x04], toPath: "\(root)/subdir/nested", progress: nil)
+        try await smb.write(data: [0x05], toPath: "\(root)/second", progress: nil)
         try await smb.copyItem(atPath: root, toPath: rootCopy, recursive: true, progress: nil)
+        // Assert every file, not just the first: a copy that silently stops
+        // after the first entry used to pass this test.
         let attribs = try await smb.attributesOfItem(atPath: "\(rootCopy)/file")
         XCTAssertEqual(attribs.fileSize, 3)
+        let nested = try await smb.contents(atPath: "\(rootCopy)/subdir/nested")
+        let second = try await smb.contents(atPath: "\(rootCopy)/second")
+        XCTAssertEqual(nested, Data([0x04]))
+        XCTAssertEqual(second, Data([0x05]))
+    }
+
+    func testCopyItemTrailingSlashLandsChildrenInsideDestination() async throws {
+        // A trailing slash on the source directory used to concatenate the
+        // destination with each child name ("dest" + "file") and scatter the
+        // children across the share root instead of inside the destination.
+        let root = folderName()
+        let rootCopy = folderName(postfix: "SlashDest")
+        let smb = SMB2Manager(url: server, credential: credential)!
+
+        addTeardownBlock {
+            try? await smb.removeDirectory(atPath: root, recursive: true)
+            try? await smb.removeDirectory(atPath: rootCopy, recursive: true)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.createDirectory(atPath: root)
+        try await smb.write(data: Data([0x01]), toPath: "\(root)/a", progress: nil)
+        try await smb.write(data: Data([0x02, 0x03]), toPath: "\(root)/b", progress: nil)
+        try await smb.copyItem(atPath: "\(root)/", toPath: rootCopy, recursive: true, progress: nil)
+        let copiedA = try await smb.contents(atPath: "\(rootCopy)/a")
+        let copiedB = try await smb.contents(atPath: "\(rootCopy)/b")
+        XCTAssertEqual(copiedA, Data([0x01]))
+        XCTAssertEqual(copiedB, Data([0x02, 0x03]))
+    }
+
+    func testDeprecatedCopyContentsOfItemCopiesEveryFile() async throws {
+        // The deprecated read/write copy path used to stop silently after
+        // the first file of a recursive copy: EOF of one file was reported
+        // through the cancellation path and read as "user aborted".
+        let root = folderName(postfix: "RW")
+        let rootCopy = folderName(postfix: "RWCopy")
+        let smb = SMB2Manager(url: server, credential: credential)!
+
+        addTeardownBlock {
+            try? await smb.removeDirectory(atPath: root, recursive: true)
+            try? await smb.removeDirectory(atPath: rootCopy, recursive: true)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.createDirectory(atPath: root)
+        let payloads = ["a": Data([0x0A]), "b": Data([0x0B, 0x0C]), "c": Data([0x0D])]
+        for (name, data) in payloads {
+            try await smb.write(data: data, toPath: "\(root)/\(name)", progress: nil)
+        }
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            smb.copyContentsOfItem(
+                atPath: root, toPath: rootCopy, recursive: true, progress: { _, _ in true }
+            ) { error in
+                if let error { cont.resume(throwing: error) } else { cont.resume() }
+            }
+        }
+        for (name, data) in payloads {
+            let copied = try await smb.contents(atPath: "\(rootCopy)/\(name)")
+            XCTAssertEqual(copied, data, "every file must be copied, not just the first")
+        }
+    }
+
+    func testConnectIgnoresNTLMUserFileEnv() async throws {
+        // Credentials come from the manager, never from NTLM_USER_FILE:
+        // connect passes a NULL user to libsmb2, so the env var is never
+        // consulted at connect time. Passing any non-NULL user (including
+        // "") makes libsmb2 re-read the file and clear the configured
+        // password, failing this test.
+        guard credential != nil else {
+            throw XCTSkip("Set SMB_USER and SMB_PASSWORD to verify credential authentication.")
+        }
+        setenv("NTLM_USER_FILE", "/dev/null", 1)
+        defer { unsetenv("NTLM_USER_FILE") }
+        let smb = SMB2Manager(url: server, credential: credential)!
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.echo()
+        try await smb.disconnectShare(gracefully: true)
     }
 
     func testRemove() async throws {
@@ -629,7 +710,7 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
                 }
             }
             group.addTask {
-                try await Task.sleep(nanoseconds: NSEC_PER_SEC)
+                try await Task.sleep(nanoseconds: 1_000_000_000)
                 try await smb.write(data: Data(), toPath: "\(folderName())/file", progress: nil)
             }
             try await group.waitForAll()

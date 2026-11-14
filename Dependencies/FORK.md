@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-7`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-10`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -54,8 +54,25 @@ the regression suites assume them.
   negotiated MaxRead/MaxWriteSize clamp to 8 MiB (forged values became
   caller-side buffer sizes); smb2_fh_from_file_id() tolerates a NULL
   context again; notify errors convert NT statuses through errno (teardown
-  reported EIO, not a bogus EPERM); chains dropped by the parking budget
-  fire their callbacks with SHUTDOWN before being freed.
+  reported EIO, not a bogus EPERM).
+- `94b02ad` — the Write count clamp compares against the on-wire amount
+  (the count after credit/size reduction), not the original request, so a
+  forged reply claiming bytes in that window can no longer silently skip
+  data in sequential writes. Budget-exhausted chains are dropped **without**
+  firing their callbacks: the earlier fire-before-free variant recursed
+  without bound on retry-style callbacks (ASan measured a 27k-frame stack
+  overflow); the bounded callback loss is the documented trade-off.
+- `2078fae` — `HAVE_ARC4RANDOM_BUF` is defined in the Apple config
+  (platform-gated: Darwin always, glibc ≥ 2.36), so `smb2_random_bytes()`
+  stops falling back to `random()` seeded with ~32 bits of guessable
+  material for the NTLMv2 client challenge, SMB 3.1.1 preauth salt, client
+  GUID and per-PDU nonces.
+- `8262429` — the read/write count clamp is skipped when the negotiated
+  size is zero ("not negotiated"): clamping to zero made the unsigned
+  `(count - 1)` credit computation wrap, and an observed 64-byte write
+  went on the wire as a 64 KiB payload read past the caller's buffer (the
+  read path wrote past it). Reachable via a hostile server negotiating
+  MaxRead/MaxWriteSize = 0.
 
 ## Syncing with upstream
 
@@ -82,17 +99,12 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 
 ## Known upstream limitations (documented, not carried as patches)
 
-- The Apple build config lacks `HAVE_COMMONCRYPTO_COMMONCRYPTOR_H`
-  (upstream only defines it via CMake), so AES falls back to the portable
-  C reference even though `aes_apple.c` is compiled in (verified by `nm`:
-  zero symbols). Defining it in Package.swift may not help much on its
-  own — that backend creates/releases a cryptor per 16-byte block; real
-  gains need cryptor reuse (cf. upstream issue #500).
-
 - A reply whose body never completes (half-received PDU in `smb2->pdu`)
   escapes `smb2_timeout_pdus`'s queue scan; AMSMB2's `timeout + 2`
   backstop covers its callers.
-- The Apple build config has no accelerated AES backend: SMB3
-  encryption/signing runs the portable C AES (~52 MB/s seal, ~100 MB/s
-  signing, measured on arm64). Fixing this needs CommonCrypto cryptor
-  reuse or armv8 crypto intrinsics.
+- The Apple build config has no accelerated AES backend (upstream only
+  defines `HAVE_COMMONCRYPTO_COMMONCRYPTOR_H` via CMake, and that backend
+  creates/releases a cryptor per 16-byte block anyway, cf. upstream issue
+  #500): SMB3 encryption/signing runs the portable C AES (~52 MB/s seal,
+  ~100 MB/s signing, measured on arm64). Fixing this needs CommonCrypto
+  cryptor reuse or armv8 crypto intrinsics.
