@@ -60,70 +60,24 @@ enum IOCtl {
     struct Command: RawRepresentable, Equatable, Hashable {
         var rawValue: UInt32
         
-        static let srvEnumerateSnapshots = Command(SMB2_FSCTL_SRV_ENUMERATE_SNAPSHOTS)
-        static let srvReadHash = Command(SMB2_FSCTL_SRV_READ_HASH)
-        static let lmrRequestResiliency = Command(SMB2_FSCTL_LMR_REQUEST_RESILIENCY)
-        static let queryNetworkInterfaceInfo = Command(SMB2_FSCTL_QUERY_NETWORK_INTERFACE_INFO)
-        static let fileLevelTrim = Command(SMB2_FSCTL_FILE_LEVEL_TRIM)
-        static let validateNegotiateInfo = Command(SMB2_FSCTL_VALIDATE_NEGOTIATE_INFO)
     }
 }
 
 // - MARK: Pipe
 extension IOCtl.Command {
-    static let pipePeek = Self(SMB2_FSCTL_PIPE_PEEK)
-    static let pipeWait = Self(SMB2_FSCTL_PIPE_WAIT)
-    static let pipeTransceive = Self(SMB2_FSCTL_PIPE_TRANSCEIVE)
 }
 
 // - MARK: DFS
 extension IOCtl.Command {
-    static let dfsGetReferrals = Self(SMB2_FSCTL_DFS_GET_REFERRALS)
-    static let dfsGetReferralsEx = Self(SMB2_FSCTL_DFS_GET_REFERRALS_EX)
 }
 
 // - MARK: Reparse Point
 extension IOCtl.Command {
-    static let getReparsePoint = Self(SMB2_FSCTL_GET_REPARSE_POINT)
     static let setReparsePoint = Self(SMB2_FSCTL_SET_REPARSE_POINT)
     static let deleteReparsePoint = Self(0x0009_00ac)
 }
 
 extension IOCtl {
-    struct Reparse: DecodableResponse, EncodableArgument {
-        typealias Element = UInt8
-        private static let headerLength = 8
-        
-        let reparseTag: UInt32
-        let buffer: Data
-        
-        var regions: [Data] {
-            [
-                .init(value: reparseTag),
-                .init(value: UInt16(buffer.count)),
-                .init(value: 0 as UInt16), // reserved
-                .init(buffer),
-            ]
-        }
-        
-        init(reparseTag: UInt32, buffer: Data = .init()) {
-            self.reparseTag = reparseTag
-            self.buffer = buffer
-        }
-        
-        init(data: Data) throws {
-            guard data.count >= Self.headerLength else {
-                throw POSIXError(.invalidArgument, description: nil)
-            }
-            self.reparseTag = data.scanValue(offset: 0, as: UInt32.self) ?? SMB2_REPARSE_TAG_SYMLINK
-
-            let count = try data.scanInt(offset: 4, as: UInt16.self).unwrap()
-            // Servers may pad past the declared length; accept it like the C
-            // decoder does (it only requires the data to fit).
-            guard count + 8 <= data.count else { throw POSIXError(.invalidArgument, description: nil) }
-            self.buffer = data.dropFirst(Int(Self.headerLength))
-        }
-    }
     
     struct SymbolicLinkReparse: DecodableResponse, EncodableArgument {
         typealias Element = UInt8
@@ -207,88 +161,4 @@ extension IOCtl {
         }
     }
     
-    struct SymbolicLinkGUIDReparse: EncodableArgument {
-        typealias Element = UInt8
-
-        // This reparse data buffer MUST be used only with reparse tag values
-        // whose high bit is set to 0.
-        private let reparseTag: UInt32 = SMB2_REPARSE_TAG_SYMLINK & 0x7fff_ffff
-        let fileId: UUID
-        
-        init(fileId: UUID = .init()) {
-            self.fileId = fileId
-        }
-
-        var regions: [Data] {
-            [
-                .init(value: reparseTag),
-                .init(value: 0 as UInt16), // buffer length
-                .init(value: 0 as UInt16), // reserved
-                .init(value: fileId),
-            ]
-        }
-
-        private init() {
-            self.fileId = .init()
-        }
-    }
-
-    struct MountPointReparse: DecodableResponse, EncodableArgument {
-        typealias Element = UInt8
-
-        private static let headerLength = 16
-        private let reparseTag: UInt32 = 0xa000_0003
-        let substituteName: String
-        let printName: String
-
-        init(data: Data) throws {
-            guard data.scanValue(offset: 0, as: UInt32.self) == reparseTag else {
-                throw POSIXError(.invalidArgument, description: nil)
-            }
-
-            let substituteOffset = try data.scanInt(offset: 8, as: UInt16.self).unwrap()
-            let substituteLen = try data.scanInt(offset: 10, as: UInt16.self).unwrap()
-            let printOffset = try data.scanInt(offset: 12, as: UInt16.self).unwrap()
-            let printLen = try data.scanInt(offset: 14, as: UInt16.self).unwrap()
-            let count = try data.scanInt(offset: 4, as: UInt16.self).unwrap()
-            guard count + 8 <= data.count else {
-                throw POSIXError(.invalidArgument, description: nil)
-            }
-            // Mount points carry 8 bytes of fields before PathBuffer.
-            guard count >= 8,
-                  substituteOffset + substituteLen <= count - 8,
-                  printOffset + printLen <= count - 8
-            else { throw POSIXError(.invalidArgument, description: nil) }
-
-            let substituteData = data.dropFirst(
-                Int(MountPointReparse.headerLength + substituteOffset)
-            ).prefix(substituteLen)
-            let printData = data.dropFirst(Int(MountPointReparse.headerLength + printOffset))
-                .prefix(printLen)
-            let substituteName = try String(data: substituteData, encoding: .utf16LittleEndian)
-                .unwrap()
-            let printName = try String(data: printData, encoding: .utf16LittleEndian).unwrap()
-
-            self.substituteName = substituteName
-            self.printName = printName
-        }
-
-        var regions: [Data] {
-            let substituteData = substituteName.data(using: .utf16LittleEndian)!
-            let substituteLen = UInt16(substituteData.count)
-            let printData = printName.data(using: .utf16LittleEndian)!
-            let printLen = UInt16(printData.count)
-            return [
-                .init(value: reparseTag),
-                .init(value: substituteLen + printLen + 8),
-                .init(value: 0 as UInt16), // reserved
-                .init(value: printLen), // substitute offset
-                .init(value: substituteLen),
-                .init(value: 0 as UInt16),
-                .init(value: printLen),
-                .init(printData),
-                .init(substituteData),
-            ]
-        }
-    }
 }

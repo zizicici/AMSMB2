@@ -22,6 +22,7 @@ var _O_SYNC: CInt { O_SYNC }
 
 
 #if os(Linux) || os(Android) || os(OpenBSD)
+@usableFromInline
 let O_SYMLINK: CInt = O_NOFOLLOW
 #endif
 @inlinable
@@ -60,11 +61,11 @@ extension FileDescriptor.OpenOptions {
     ///
     /// The corresponding C constant is `O_SYMLINK`.
     @_alwaysEmitIntoClient
-    public static var symlink: OpenOptions { .init(rawValue: _O_SYMLINK) }
+    public static var symlink: FileDescriptor.OpenOptions { .init(rawValue: _O_SYMLINK) }
 
     @_alwaysEmitIntoClient
     @available(*, unavailable, renamed: "symlink")
-    public static var O_SYMLINK: OpenOptions { symlink }
+    public static var O_SYMLINK: FileDescriptor.OpenOptions { symlink }
 #endif
 }
 
@@ -76,16 +77,8 @@ final class SMB2FileHandle: @unchecked Sendable {
         try self.init(path, .readOnly, on: client)
     }
 
-    convenience init(forWritingAtPath path: String, on client: SMB2Client) throws {
-        try self.init(path, .writeOnly, on: client)
-    }
-
     convenience init(forUpdatingAtPath path: String, on client: SMB2Client) throws {
         try self.init(path, .readWrite, options: [.append] , on: client)
-    }
-
-    convenience init(forOverwritingAtPath path: String, on client: SMB2Client) throws {
-        try self.init(path, .writeOnly, options: [.truncate], on: client)
     }
 
     convenience init(forOverwritingOrCreatingAtPath path: String, on client: SMB2Client) throws {
@@ -427,26 +420,6 @@ final class SMB2FileHandle: @unchecked Sendable {
         }
     }
     
-    func flock(_ op: LockOperation) throws {
-        try client.async_await_pdu { context, dataPtr in
-            var element = smb2_lock_element(
-                offset: 0,
-                length: 0,
-                flags: op.smb2Flag,
-                reserved: 0
-            )
-            return withUnsafeMutablePointer(to: &element) { element in
-                var request = smb2_lock_request(
-                    lock_count: 1,
-                    lock_sequence_number: 0,
-                    lock_sequence_index: 0,
-                    file_id: fileId.uuid,
-                    locks: element
-                )
-                return smb2_cmd_lock_async(context, &request, SMB2Client.generic_handler, dataPtr)
-            }
-        }
-    }
     
     func changeNotify(for type: SMB2FileChangeType) throws -> [SMB2FileChangeInfo] {
         let handle = try handle.unwrap()
@@ -502,23 +475,7 @@ final class SMB2FileHandle: @unchecked Sendable {
 }
 
 extension SMB2FileHandle {
-    struct LockOperation: OptionSet, Sendable {
-        var rawValue: Int32
-        
-        static let shared = LockOperation(rawValue: LOCK_SH)
-        static let exclusive = LockOperation(rawValue: LOCK_EX)
-        static let unlock = LockOperation(rawValue: LOCK_UN)
-        static let nonBlocking = LockOperation(rawValue: LOCK_NB)
-        
-        var smb2Flag: UInt32 {
-            var result: UInt32 = 0
-            if contains(.shared) { result |= 0x0000_0001 }
-            if contains(.exclusive) { result |= 0x0000_0002 }
-            if contains(.unlock) { result |= 0x0000_0004 }
-            if contains(.nonBlocking) { result |= 0x0000_0010 }
-            return result
-        }
-    }
+
     
     struct Attributes: OptionSet, Sendable {
         var rawValue: UInt32

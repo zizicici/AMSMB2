@@ -23,18 +23,7 @@ extension Stream {
         try handler()
     }
     
-    func withOpenStream(_ handler: () async throws -> Void) async rethrows {
-        let shouldCloseStream = streamStatus == .notOpen
-        if streamStatus == .notOpen {
-            open()
-        }
-        defer {
-            if shouldCloseStream {
-                close()
-            }
-        }
-        try await handler()
-    }
+
 }
 
 extension InputStream {
@@ -90,19 +79,7 @@ extension AsyncThrowingStream where Element == Data, Failure == any Error {
         }
     }
     
-    func write(toFileAt file: URL) async throws {
-        guard let stream = OutputStream(url: file, append: false) else {
-            throw POSIXError(.noSuchFileOrDirectory, description: nil)
-        }
-        try await stream.withOpenStream {
-            for try await data in self {
-                let written = try stream.write(data)
-                guard written == data.count else {
-                    throw POSIXError(.ioError, description: "Short write to destination file.")
-                }
-            }
-        }
-    }
+
 }
 
 /// Prefetch pauses once this many bytes are buffered, so a fast producer

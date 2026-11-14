@@ -765,6 +765,29 @@ final class SMB2ManagerCodingTests: XCTestCase {
         XCTAssertEqual(original.timeout, 77)
     }
 
+    /// The round-trip comparison above is self-referential on the encoder:
+    /// an encode-side field drop is invisible. Assert decoded fields
+    /// directly against known values.
+    func testCodingFidelityDirectFieldAssertions() throws {
+        let original = SMB2Manager(
+            url: URL(string: "smb://192.168.1.1/share")!,
+            credential: URLCredential(user: "DOM;WS\\secret", password: "p@ss", persistence: .forSession)
+        )!
+        original.timeout = 42
+
+        let json = try JSONEncoder().encode(original)
+        let decoded = try JSONDecoder().decode(SMB2Manager.self, from: json)
+        XCTAssertEqual(decoded.timeout, 42)
+        // domain/workstation/user/password round-trip through JSON
+        let dict = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: json) as? [String: Any]
+        )
+        XCTAssertEqual(dict["domain"] as? String, "DOM")
+        XCTAssertEqual(dict["workstation"] as? String, "WS")
+        XCTAssertEqual(dict["user"] as? String, "secret")
+        XCTAssertEqual(dict["password"] as? String, "p@ss")
+    }
+
     func testCodingFidelityPlainUser() throws {
         try fidelityRoundTrip {
             SMB2Manager(

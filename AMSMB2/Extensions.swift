@@ -48,11 +48,7 @@ extension RawRepresentable where RawValue == UInt32 {
     }
 }
 
-extension RawRepresentable where RawValue == UInt16 {
-    init(_ rawValue: Int16) {
-        self.init(rawValue: .init(bitPattern: rawValue))!
-    }
-}
+
 
 extension POSIXError {
     static func throwIfError<Number: SignedInteger>(_ result: Number, description: String?) throws {

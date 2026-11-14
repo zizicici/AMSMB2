@@ -468,10 +468,16 @@ extension SMB2Client {
             }
             let pollResult = poll(&pfd, 1, 1000)
             if pollResult < 0 {
-                // Darwin.errno: the bare `errno` resolves to this client's
-                // NT-status property, which made the EINTR/EAGAIN check
-                // compare the wrong value since it was written.
+                // The bare `errno` resolves to this client's NT-status
+                // property, which made the EINTR/EAGAIN check compare the
+                // wrong value since it was written.
+                #if canImport(Darwin)
                 let pollErrno = Errno(rawValue: Darwin.errno)
+                #elseif canImport(Glibc)
+                let pollErrno = Errno(rawValue: Glibc.errno)
+                #else
+                let pollErrno = Errno(rawValue: errno)
+                #endif
                 if pollErrno != .resourceTemporarilyUnavailable, pollErrno != .interrupted {
                     throw POSIXError(pollErrno, description: errorString)
                 }

@@ -27,6 +27,9 @@ import SystemPackage
 @objc(AMSMB2Manager)
 #endif
 public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomReflectable, @unchecked Sendable {
+    // The Codable/NSSecureCoding conformances below serialize _password in
+    // plaintext. Do not persist encoded managers to disk or logs; use the
+    // keychain for credential storage.
     public typealias SimpleCompletionHandler = (@Sendable (_ error: (any Error)?) -> Void)?
     public typealias ReadProgressHandler = (@Sendable (_ bytes: Int64, _ total: Int64) -> Bool)?
     public typealias WriteProgressHandler = (@Sendable (_ bytes: Int64) -> Bool)?
@@ -1584,7 +1587,10 @@ extension SMB2Manager {
         // them, and libsmb2 splits host:port on the first colon.
         let host = url.host!.contains(":") ? "[\(url.host!)]" : url.host!
         let server = host + (url.port.map { ":\($0)" } ?? "")
-        try client.connect(server: server, share: shareName, user: _user)
+        // Pass an empty user: smb2_connect_share_async re-reads
+        // NTLM_USER_FILE and would override or clear the configured
+        // credentials when that environment variable is set.
+        try client.connect(server: server, share: shareName, user: "")
         return client
     }
 
@@ -1901,10 +1907,6 @@ extension SMB2Manager {
                     totalWritten += UInt64(written)
                 }
 
-                var offset = try file.seek(offset: 0, from: .current)
-                if offset > totalWritten {
-                    offset = Int64(totalWritten)
-                }
                 if let shouldContinue = progress?(Int64(totalWritten)), !shouldContinue {
                     break
                 }
