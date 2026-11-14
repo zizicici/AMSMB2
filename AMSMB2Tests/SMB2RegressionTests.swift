@@ -292,6 +292,29 @@ final class SMB2RegressionTests: XCTestCase {
         XCTAssertFalse(client.isActive)
     }
 
+    // MARK: teardown sweeps handles the caller never closed
+
+    func test_DestroyContextSweepsUnclosedHandles() throws {
+        // smb2_destroy_context() promises to free any open smb2fh/smb2dir.
+        // Open handles and drop them without closing: the teardown must sweep
+        // them (under ASan: exactly once, no double free, no corruption).
+        let (client, peer) = try makeClient()
+        let finished = expectation(description: "sweep peer finished")
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            var byte: UInt8 = 0
+            _ = recv(peer, &byte, 1, 0) // context torn down without traffic
+        }
+        var handles = [SMB2FileHandle]()
+        for _ in 0..<64 {
+            handles.append(try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client))
+        }
+        handles.removeAll()
+        client.destroyContext()
+        XCTAssertFalse(client.isActive)
+        wait(for: [finished], timeout: 10)
+    }
+
     // MARK: fd 0 is a valid socket
 
     func test_FileDescriptorZeroIsValidSocket() {
