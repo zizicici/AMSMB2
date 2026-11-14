@@ -28,6 +28,8 @@ jobs:
   linux:
     name: Build and test (Linux)
     runs-on: ubuntu-latest
+    # Same image as the Dockerfile / 'make cleanlinuxtest'.
+    container: swift:6.1
     steps:
     - uses: actions/checkout@v4
       with:
@@ -52,15 +54,21 @@ jobs:
         --filter "SMB2LifetimeTests|SMB2RegressionTests|SMB2FileStatTests|SMB2TimestampTests"
 
   watchos:
-    name: Build only (watchOS)
+    name: Build only (watchOS, incl. arm64_32)
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
       with:
         submodules: recursive
     - name: Build
-      # arm64_32/time_t width traps are exactly what this job guards.
-      run: swift build --destination 'generic/platform=watchOS Simulator'
+      # The device destination is the one that carries the arm64_32 slice
+      # (32-bit time_t/Int); the simulator is plain arm64 and would not
+      # catch width traps. SwiftPM's own --destination takes a file path,
+      # so this has to go through xcodebuild.
+      run: >
+        xcodebuild -scheme AMSMB2
+        -destination 'generic/platform=watchOS'
+        CODE_SIGNING_ALLOWED=NO build
 
   maccatalyst:
     name: Build only (macCatalyst)
@@ -70,4 +78,7 @@ jobs:
       with:
         submodules: recursive
     - name: Build
-      run: swift build --destination 'generic/platform=macOS,variant=Mac Catalyst'
+      run: >
+        xcodebuild -scheme AMSMB2
+        -destination 'generic/platform=macOS,variant=Mac Catalyst'
+        CODE_SIGNING_ALLOWED=NO build
