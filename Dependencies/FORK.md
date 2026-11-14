@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-4`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-5`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -33,11 +33,14 @@ the regression suites assume them.
 - `cfa6e9d` — POLLHUP no longer discards replies already sitting in the
   socket buffer (the peer answering and hanging up in one burst reported
   the operation as failed); the connect-stage POLLHUP completion tries
-  the next resolved address like POLLERR/POLLOUT; the encryption-abort
-  path guards against unbounded synchronous re-entry from callbacks; the
-  compound writev aggregation caps its iovec count; and all
-  allocation-failure paths of the stat/truncate/rename compounds complete
-  the caller with -ENOMEM.
+  the next resolved address like POLLERR/POLLOUT; the compound writev
+  aggregation caps its iovec count; and all allocation-failure paths of
+  the stat/truncate/rename compounds complete the caller with -ENOMEM.
+- `6c5987e`/`7c0bfcd` — commands synchronously queued from inside an
+  encryption-abort callback are parked and completed iteratively (a
+  bounded budget stops a pathological re-queueing callback; the parked
+  error string is no longer overwritten), and the POLLHUP input drain is
+  skipped while still connecting.
 
 ## Syncing with upstream
 

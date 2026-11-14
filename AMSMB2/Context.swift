@@ -339,10 +339,14 @@ extension SMB2Client {
         // server resolves it against the link's own directory
         // ([MS-FSCC] 2.1.2.4).
         let target = destination.replacingOccurrences(of: "/", with: "\\")
-        let isAbsolute = target.first == "\\" || target.dropFirst().first == ":"
+        let isAbsolute = target.hasPrefix("\\")
+            || (target.count >= 2 && target.first?.isLetter == true && target.dropFirst().first == ":")
         let wireTarget = isAbsolute ? "\\??\\" + target : target
-        let utf16Bytes = wireTarget.utf16.count * 2
-        guard utf16Bytes <= Int(UInt16.max) - 16 else {
+        // The reparse buffer carries the target twice (substitute and print
+        // names) and ReparseDataLength must cover both plus 12 bytes of
+        // field offsets; everything has to fit a UInt16.
+        let nameBytes = wireTarget.utf16.count * 2
+        guard 2 * nameBytes + 12 <= Int(UInt16.max) else {
             throw POSIXError(.invalidArgument, description: "Symbolic link target is too long.")
         }
         let file = try SMB2FileHandle(
@@ -538,7 +542,13 @@ extension SMB2Client {
     /// needlessly kill a live connection over e.g. an invalid argument.
     private func cancelRequest(_ cb: CBData, pointer: UnsafeMutableRawPointer) {
         cb.detachHandler()
-        Unmanaged<CBData>.fromOpaque(pointer).release()
+        if !cb.isFinished {
+            // Some setup failures (the C side's allocation-failure paths)
+            // fire the callback and *then* return a negative value; the
+            // callback already consumed the retain, so only drop it when
+            // the callback never ran.
+            Unmanaged<CBData>.fromOpaque(pointer).release()
+        }
     }
 
     @discardableResult

@@ -89,5 +89,10 @@ final class SMB2WireFormatTests: XCTestCase {
         XCTAssertEqual((5..<Int32.max).int64Range, 5..<Int64(Int32.max))
         XCTAssertEqual((100...).int64Range, 100..<Int64.max)
         XCTAssertEqual((0..<0).int64Range, 0..<0)
+        // Narrow bounds whose successor is representable must NOT be
+        // widened to "the whole file".
+        XCTAssertEqual((0...UInt32.max).int64Range, 0..<4_294_967_296)
+        XCTAssertEqual((0...Int8.max).int64Range, 0..<128)
+        XCTAssertEqual((...UInt16.max).int64Range, 0..<65_536)
     }
 }

@@ -183,9 +183,13 @@ extension RangeExpression where Bound: FixedWidthInteger {
             upper = Int64(clamping: range.upperBound)
         case let range as ClosedRange<Bound>:
             lower = Int64(clamping: range.lowerBound)
-            upper = range.upperBound == Bound.max
+            // The inclusive-to-exclusive conversion needs upperBound + 1;
+            // that is only unrepresentable when the bound's Int64 value is
+            // already saturated (e.g. 0...Int64.max). Narrow bounds such as
+            // UInt32.max convert fine and must not be widened to whole-file.
+            upper = Int64(clamping: range.upperBound) == Int64.max
                 ? Int64.max
-                : Int64(clamping: range.upperBound &+ 1)
+                : Int64(clamping: range.upperBound) + 1
         case let range as PartialRangeFrom<Bound>:
             lower = Int64(clamping: range.lowerBound)
             upper = Int64.max
@@ -194,9 +198,9 @@ extension RangeExpression where Bound: FixedWidthInteger {
             upper = Int64(clamping: range.upperBound)
         case let range as PartialRangeThrough<Bound>:
             lower = 0
-            upper = range.upperBound == Bound.max
+            upper = Int64(clamping: range.upperBound) == Int64.max
                 ? Int64.max
-                : Int64(clamping: range.upperBound &+ 1)
+                : Int64(clamping: range.upperBound) + 1
         default:
             lower = 0
             upper = Int64.max
