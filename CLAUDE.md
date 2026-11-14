@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-AMSMB2 is a Swift library that wraps [libsmb2 fork](https://github.com/zizicici/libsmb2) (based on [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2)) to provide SMB2/3 file operations for Apple platforms (iOS 14+, macOS 11+, tvOS 14+, watchOS 7+, visionOS 1+) and Linux.
+AMSMB2 is a Swift library that wraps [libsmb2 fork](https://github.com/zizicici/libsmb2) (based on [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2)) to provide SMB2/3 file operations for Apple platforms (iOS 14+, macOS 11+, macCatalyst 14+, tvOS 14+, watchOS 7+, visionOS 1+) and Linux.
 
 **License note:** The library must be linked dynamically due to libsmb2's LGPL v2.1 license requirements for App Store distribution.
 
@@ -20,9 +20,12 @@ swift test
 # Run a specific test
 swift test --filter SMB2ManagerTests/testName
 
+# AddressSanitizer regression guard (see Dependencies/FORK.md)
+make asan-test
+
 # Linux testing via Docker
-make linuxtest              # Uses local volume mount
-make cleanlinuxtest         # Clean Docker build
+make cleanlinuxtest         # Clean Docker build (the reliable path)
+make linuxtest              # Volume-mount variant; may shadow the image tree
 ```
 
 ## Architecture
@@ -39,7 +42,7 @@ make cleanlinuxtest         # Clean Docker build
 
 - [Directory.swift](AMSMB2/Directory.swift) - Directory handle for enumeration
 - [Stream.swift](AMSMB2/Stream.swift) - InputStream/OutputStream implementations for streaming I/O
-- [Fsctl.swift](AMSMB2/Fsctl.swift) - FSCTL operations (server-side copy via IOCTL)
+- [Fsctl.swift](AMSMB2/Fsctl.swift) - Reparse-point codecs and IOCTL command/response plumbing (server-side copy itself lives in FileHandle.swift)
 - [ObjCCompat.swift](AMSMB2/ObjCCompat.swift) - Objective-C compatibility layer with completion handler-based APIs
 
 ### Dependencies

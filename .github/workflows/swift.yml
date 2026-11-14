@@ -8,6 +8,7 @@ on:
     branches: [ "master" ]
   pull_request:
     branches: [ "master" ]
+  workflow_dispatch:
 
 jobs:
   test:
@@ -24,6 +25,18 @@ jobs:
       # Server-dependent tests skip themselves without SMB_SERVER/SMB_SHARE.
       run: swift test
 
+  linux:
+    name: Build and test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Build
+      run: swift build
+    - name: Test
+      run: swift test
+
   asan:
     name: Memory-sanitized tests (macOS)
     runs-on: macos-latest
@@ -37,3 +50,24 @@ jobs:
       run: >
         swift test --sanitize=address
         --filter "SMB2LifetimeTests|SMB2RegressionTests|SMB2FileStatTests|SMB2TimestampTests"
+
+  watchos:
+    name: Build only (watchOS)
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Build
+      # arm64_32/time_t width traps are exactly what this job guards.
+      run: swift build --destination 'generic/platform=watchOS Simulator'
+
+  maccatalyst:
+    name: Build only (macCatalyst)
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: recursive
+    - name: Build
+      run: swift build --destination 'generic/platform=macOS,variant=Mac Catalyst'

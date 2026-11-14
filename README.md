@@ -1,21 +1,18 @@
 # AMSMB2
 
 
-This is small Swift library for iOS, macOS, tvOS, watchOS, visionOS (and Linux) which wraps [libsmb2 fork](https://github.com/zizicici/libsmb2) (based on [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2)) and allows to connect a SMB2/3 share and do file operation.
+This is small Swift library for iOS, macOS, macCatalyst, tvOS, watchOS, visionOS (and Linux) which wraps [libsmb2 fork](https://github.com/zizicici/libsmb2) (based on [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2)) and allows to connect a SMB2/3 share and do file operation.
 
-[![Swift Version Compatibility][swift-version-image]][swift-version-url]
-[![Platform Compatibility ][platform-image]][platform-url]
 [![License][license-image]][license-url]
-[![Release version][release-image]][release-url]
 
 
 ## Getting Started
 
-To use AMSMB2, add the following dependency to your Package.swift:
+This fork lives at [zizicici/AMSMB2](https://github.com/zizicici/AMSMB2) and pins its own libsmb2 fork as a git submodule (`Dependencies/libsmb2`) — clone with `--recursive`. To use it, add the following dependency to your Package.swift:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/amosavian/AMSMB2", .upToNextMinor(from: "3.0.0"))
+    .package(url: "https://github.com/zizicici/AMSMB2", .branch("master"))
 ]
 ```
 
@@ -97,11 +94,5 @@ While source code shipped with project is MIT licensed, but it has static link t
 
 You **must** link this library dynamically to your app if you intend to distribute your app on App Store.
 
-[swift-version-image]: https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Famosavian%2FAMSMB2%2Fbadge%3Ftype%3Dswift-versions
-[swift-version-url]: https://swiftpackageindex.com/amosavian/AMSMB2
-[platform-image]: https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Famosavian%2FAMSMB2%2Fbadge%3Ftype%3Dplatforms
-[platform-url]: https://swiftpackageindex.com/amosavian/AMSMB2
-[license-image]: https://img.shields.io/github/license/amosavian/AMSMB2.svg
+[license-image]: https://img.shields.io/github/license/zizicici/AMSMB2.svg
 [license-url]: LICENSE
-[release-image]: https://img.shields.io/github/release/amosavian/AMSMB2.svg
-[release-url]: https://github.com/amosavian/AMSMB2/releases

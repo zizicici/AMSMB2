@@ -120,18 +120,10 @@ public struct SMB2FileChangeAction: RawRepresentable, Hashable, Sendable, Custom
         self.rawValue = .init(bitPattern: rawValue)
     }
     
-    /// The file was renamed, and FileName contains the new name.
-    ///
-    /// This notification is only sent when the rename operation does not change the directory the file resides in.
-    /// The client will also receive a `removed` notification.
-    /// This notification will not be received if the file is renamed within a directory.
+    /// The file was added to the directory.
     public static let added = Self(rawValue: SMB2_NOTIFY_CHANGE_FILE_ACTION_ADDED)
-    
-    /// The file was renamed, and FileName contains the old name.
-    ///
-    /// This notification is only sent when the rename operation does not change the directory the file resides in.
-    /// The client will also receive a `added` notification.
-    /// This notification will not be received if the file is renamed within a directory.
+
+    /// The file was removed from the directory.
     public static let removed = Self(rawValue: SMB2_NOTIFY_CHANGE_FILE_ACTION_REMOVED)
     
     /// The file was modified. This can be a change to the data or attributes of the file.

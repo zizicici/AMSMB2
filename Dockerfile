@@ -1,4 +1,4 @@
-FROM swift:6.0
+FROM swift:6.1
 
 # Add nonroot user
 RUN groupadd -r nonroot && useradd -r -g nonroot nonroot
@@ -12,9 +12,11 @@ USER nonroot
 WORKDIR /home/nonroot/src/app
 VOLUME /home/nonroot/src/app
 
+# The C target lives in Dependencies/ (smb2-module shim + libsmb2 submodule);
+# swift-system/swift-atomics are fetched from the registry at build time.
+COPY Package.swift ./
 COPY AMSMB2 ./AMSMB2
 COPY AMSMB2Tests ./AMSMB2Tests
-COPY Package.swift ./
-COPY Package@swift-6.0.swift ./
+COPY Dependencies ./Dependencies
 
 ENTRYPOINT ["swift", "test"]
