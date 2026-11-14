@@ -96,7 +96,10 @@ extension AsyncThrowingStream where Element == Data, Failure == any Error {
         }
         try await stream.withOpenStream {
             for try await data in self {
-                _ = try stream.write(data)
+                let written = try stream.write(data)
+                guard written == data.count else {
+                    throw POSIXError(.ioError, description: "Short write to destination file.")
+                }
             }
         }
     }

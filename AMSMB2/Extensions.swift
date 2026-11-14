@@ -171,10 +171,37 @@ extension Array where Element == SMB2Share {
 
 extension RangeExpression where Bound: FixedWidthInteger {
     var int64Range: Range<Int64> {
-        let range: Range<Bound> = relative(to: 0..<Bound.max)
-        let lower = Int64(exactly: range.lowerBound) ?? (Int64.max - 1)
-        let upper = Int64(exactly: range.upperBound) ?? Int64.max
-        return lower..<upper
+        // Handled per shape: relative(to:) on a collection that excludes
+        // Bound.max traps for closed upper bounds at .max (the successor of
+        // .max does not exist), and callers legitimately pass 0...Int64.max
+        // to mean "the whole file".
+        let lower: Int64
+        let upper: Int64
+        switch self {
+        case let range as Range<Bound>:
+            lower = Int64(clamping: range.lowerBound)
+            upper = Int64(clamping: range.upperBound)
+        case let range as ClosedRange<Bound>:
+            lower = Int64(clamping: range.lowerBound)
+            upper = range.upperBound == Bound.max
+                ? Int64.max
+                : Int64(clamping: range.upperBound &+ 1)
+        case let range as PartialRangeFrom<Bound>:
+            lower = Int64(clamping: range.lowerBound)
+            upper = Int64.max
+        case let range as PartialRangeUpTo<Bound>:
+            lower = 0
+            upper = Int64(clamping: range.upperBound)
+        case let range as PartialRangeThrough<Bound>:
+            lower = 0
+            upper = range.upperBound == Bound.max
+                ? Int64.max
+                : Int64(clamping: range.upperBound &+ 1)
+        default:
+            lower = 0
+            upper = Int64.max
+        }
+        return min(lower, upper)..<max(lower, upper)
     }
 }
 
@@ -263,7 +290,7 @@ extension Data {
 
     func scanValue<T: FixedWidthInteger>(offset: Int, as _: T.Type) -> T? {
         guard count >= offset + MemoryLayout<T>.size else { return nil }
-        return T(littleEndian: withUnsafeBytes { $0.load(fromByteOffset: offset, as: T.self) })
+        return T(littleEndian: withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: T.self) })
     }
 
     func scanInt<T: FixedWidthInteger & SendableMetatype>(offset: Int, as _: T.Type) -> Int? {

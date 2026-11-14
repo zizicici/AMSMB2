@@ -15,7 +15,8 @@ public struct SMB2FileChangeType: OptionSet, Hashable, Sendable, CustomStringCon
     public var rawValue: UInt32
     
     var completionFilter: UInt32 {
-        rawValue & 0x00ff_ffff
+        // [MS-SMB2] 2.2.35 defines the low 12 bits only.
+        rawValue & 0x0fff
     }
     
     public var description: String {

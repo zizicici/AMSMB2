@@ -315,6 +315,45 @@ final class SMB2RegressionTests: XCTestCase {
         wait(for: [finished], timeout: 10)
     }
 
+    // MARK: a reply delivered right before the peer hangs up must survive
+
+    func test_ReadSucceedsWhenPeerClosesRightAfterReply() throws {
+        // POLLIN|POLLHUP are reported together when the peer answers and
+        // immediately closes: the reply sitting in the socket buffer must be
+        // processed (fork "drain POLLHUP input") instead of being discarded
+        // in favor of a connection error — that would report a write the
+        // server already performed as failed.
+        let (client, peer) = try makeClient()
+        let finished = expectation(description: "Closing-after-reply peer finished")
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            do {
+                let request = try receivePacket(peer)
+                XCTAssertEqual(request.number(at: 12, UInt16.self), UInt16(SMB2_READ.rawValue))
+                let count = 16
+                var body = Data(repeating: 0, count: 16)
+                body.put(UInt16(17), at: 0)
+                body[2] = 80
+                body.put(UInt32(count), at: 4)
+                var reply = response(for: request) + body + Data(repeating: 0x42, count: count)
+                var length = UInt32(reply.count).bigEndian
+                reply = withUnsafeBytes(of: &length) { Data($0) } + reply
+                try sendAll(peer, reply)
+                // The reply lands and the socket dies in the same burst; the
+                // kernel reports POLLIN|POLLHUP together.
+            } catch {
+                XCTFail("Reply-then-close peer: \(error)")
+            }
+        }
+        let file = try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client)
+        defer {
+            client.destroyContext()
+            wait(for: [finished], timeout: 10)
+        }
+        let data = try file.read(length: 64)
+        XCTAssertEqual(data, Data(repeating: 0x42, count: 16))
+    }
+
     // MARK: fd 0 is a valid socket
 
     func test_FileDescriptorZeroIsValidSocket() {

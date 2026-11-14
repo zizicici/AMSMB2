@@ -334,10 +334,21 @@ extension SMB2Client {
     }
     
     func symlink(_ path: String, to destination: String) throws {
+        // Mirrors libsmb2: an absolute target gets the NT object-manager
+        // prefix and must not carry SMB2_SYMLINK_FLAG_RELATIVE, or the
+        // server resolves it against the link's own directory
+        // ([MS-FSCC] 2.1.2.4).
+        let target = destination.replacingOccurrences(of: "/", with: "\\")
+        let isAbsolute = target.first == "\\" || target.dropFirst().first == ":"
+        let wireTarget = isAbsolute ? "\\??\\" + target : target
+        let utf16Bytes = wireTarget.utf16.count * 2
+        guard utf16Bytes <= Int(UInt16.max) - 16 else {
+            throw POSIXError(.invalidArgument, description: "Symbolic link target is too long.")
+        }
         let file = try SMB2FileHandle(
             path: path, .readWrite, options: [.create, .exclusiveCreate, .symlink, .sync], on: self
         )
-        let reparse = IOCtl.SymbolicLinkReparse(path: destination, isRelative: true)
+        let reparse = IOCtl.SymbolicLinkReparse(path: wireTarget, isRelative: !isAbsolute)
         try file.fcntl(command: .setReparsePoint, args: reparse)
     }
 }
@@ -522,6 +533,14 @@ extension SMB2Client {
         }
     }
 
+    /// The setup call failed synchronously: nothing of this request was
+    /// queued, so no teardown is needed — destroying the context here would
+    /// needlessly kill a live connection over e.g. an invalid argument.
+    private func cancelRequest(_ cb: CBData, pointer: UnsafeMutableRawPointer) {
+        cb.detachHandler()
+        Unmanaged<CBData>.fromOpaque(pointer).release()
+    }
+
     @discardableResult
     func async_await(execute handler: UnsafeContextHandler<Int32>) throws -> Int32 {
         try async_await(dataHandler: { _, _ in }, execute: handler).result
@@ -553,7 +572,8 @@ extension SMB2Client {
                 result = try handler(context, cbPtr)
                 try POSIXError.throwIfError(result, description: errorString)
             } catch {
-                abortRequest(cb, pointer: cbPtr)
+                // Nothing was queued on our behalf; keep the connection.
+                cancelRequest(cb, pointer: cbPtr)
                 throw error
             }
 
@@ -613,7 +633,8 @@ extension SMB2Client {
             do {
                 pdu = try handler(context, cbPtr).unwrap()
             } catch {
-                abortRequest(cb, pointer: cbPtr)
+                // Nothing was queued on our behalf; keep the connection.
+                cancelRequest(cb, pointer: cbPtr)
                 throw error
             }
             smb2_queue_pdu(context, pdu)

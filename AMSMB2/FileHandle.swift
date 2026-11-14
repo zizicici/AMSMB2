@@ -228,23 +228,19 @@ final class SMB2FileHandle: @unchecked Sendable {
     }
     
     func set(stat: smb2_stat_64, attributes: Attributes) throws {
+        // time_t is 32-bit on arm64_32: clamp instead of trapping for dates
+        // beyond 2038 there (no-op on 64-bit platforms).
+        func timeval(seconds: UInt64, nanoseconds: UInt64) -> smb2_timeval {
+            smb2_timeval(
+                tv_sec: time_t(clamping: Int64(bitPattern: seconds)),
+                tv_usec: .init(nanoseconds / 1000)
+            )
+        }
         let bfi = smb2_file_basic_info(
-            creation_time: smb2_timeval(
-                tv_sec: .init(stat.smb2_btime),
-                tv_usec: .init(stat.smb2_btime_nsec / 1000)
-            ),
-            last_access_time: smb2_timeval(
-                tv_sec: .init(stat.smb2_atime),
-                tv_usec: .init(stat.smb2_atime_nsec / 1000)
-            ),
-            last_write_time: smb2_timeval(
-                tv_sec: .init(stat.smb2_mtime),
-                tv_usec: .init(stat.smb2_mtime_nsec / 1000)
-            ),
-            change_time: smb2_timeval(
-                tv_sec: .init(stat.smb2_ctime),
-                tv_usec: .init(stat.smb2_ctime_nsec / 1000)
-            ),
+            creation_time: timeval(seconds: stat.smb2_btime, nanoseconds: stat.smb2_btime_nsec),
+            last_access_time: timeval(seconds: stat.smb2_atime, nanoseconds: stat.smb2_atime_nsec),
+            last_write_time: timeval(seconds: stat.smb2_mtime, nanoseconds: stat.smb2_mtime_nsec),
+            change_time: timeval(seconds: stat.smb2_ctime, nanoseconds: stat.smb2_ctime_nsec),
             file_attributes: attributes.rawValue,
             // Raw FILETIME fields are decode-only; the encoder reads the timevals.
             creation_time_raw: 0,
@@ -427,6 +423,7 @@ final class SMB2FileHandle: @unchecked Sendable {
     }
     
     func changeNotify(for type: SMB2FileChangeType) throws -> [SMB2FileChangeInfo] {
+        let handle = try handle.unwrap()
         let (_, result) = try client.async_await(dataHandler: [SMB2FileChangeInfo].init) { context, dataPtr in
             smb2_notify_change_filehandle_async(
                 context, handle,
@@ -447,19 +444,28 @@ final class SMB2FileHandle: @unchecked Sendable {
         defer { withExtendedLifetime(args) {} }
         var inputBuffer = [UInt8](args)
         return try inputBuffer.withUnsafeMutableBytes { buf in
-            var req = smb2_ioctl_request(
-                ctl_code: command.rawValue,
-                file_id: fileId.uuid,
-                input_offset: 0, input_count: .init(buf.count),
-                max_input_response: 0,
-                output_offset: 0, output_count: UInt32(client.maximumTransactionSize),
-                max_output_response: 65535,
-                flags: .init(SMB2_0_IOCTL_IS_FSCTL),
-                input: buf.baseAddress
+            // max_output_response is clamped like the C wrappers do, so
+            // SMB 2.0.2 servers with a small MaxTransactSize do not reject
+            // the request outright.
+            let maxOutputResponse = UInt32(
+                max(0, min(65_535, client.maximumTransactionSize - 8 - buf.count))
             )
-            return try client.async_await_pdu(dataHandler: R.init) {
-                context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
-                smb2_cmd_ioctl_async(context, &req, SMB2Client.generic_handler, cbPtr)
+            return try client.async_await_pdu(dataHandler: R.init) { [handle] context, cbPtr
+                -> UnsafeMutablePointer<smb2_pdu>? in
+                // file_id is resolved here, under the context lock: the
+                // teardown sweep frees closed file handles, so touching the
+                // handle outside the lock races a concurrent disconnect.
+                var req = smb2_ioctl_request(
+                    ctl_code: command.rawValue,
+                    file_id: smb2_get_file_id(try handle.unwrap()).pointee,
+                    input_offset: 0, input_count: .init(buf.count),
+                    max_input_response: 0,
+                    output_offset: 0, output_count: UInt32(client.maximumTransactionSize),
+                    max_output_response: maxOutputResponse,
+                    flags: .init(SMB2_0_IOCTL_IS_FSCTL),
+                    input: buf.baseAddress
+                )
+                return smb2_cmd_ioctl_async(context, &req, SMB2Client.generic_handler, cbPtr)
             }.data
         }
     }
@@ -757,34 +763,44 @@ extension SMB2FileHandle {
     
     struct CreateLeaseContext: EncodableArgument {
         typealias Element = UInt8
-        
+
         private static let headerLength = 24
-        private static let leaseLength = UInt32(SMB2_CREATE_REQUEST_LEASE_SIZE)
-        
+
+        /// The create-context name is defined in network byte order
+        /// ([MS-SMB2] 2.2.13.2), unlike every other SMB2 integer field.
+        private static let name: [UInt8] = [0x52, 0x71, 0x4c, 0x73] // "RqLs"
+
         var state: LeaseState
         var key: UUID
         var parentKey: UUID?
-                
+
         var regions: [Data] {
-            [
+            // Without a parent key this is a plain V1 lease context
+            // (DataLength 32); with one it is the V2 form (DataLength 52) —
+            // the two share the "RqLs" name and are told apart only by
+            // DataLength. V1 requires LeaseFlags to be 0.
+            let isV2 = parentKey != nil
+            let dataLength: UInt32 = isV2 ? 52 : UInt32(SMB2_CREATE_REQUEST_LEASE_SIZE)
+            return [
                 .init(value: 0 as UInt32), // chain offset
-                .init(value: 16 as UInt16), // tag offset
-                .init(value: 4 as UInt16), // tag length lo
-                .init(value: 0 as UInt16), // tag length up
-                .init(value: UInt16(Self.headerLength)), // context offset
-                .init(value: UInt32(Self.leaseLength)), // context length
-                .init(value: 0x5271_4c73 as UInt32),
-                .init(value: 0 as UInt32),
+                .init(value: 16 as UInt16), // name offset
+                .init(value: 4 as UInt16), // name length
+                .init(value: 0 as UInt16), // reserved
+                .init(value: UInt16(Self.headerLength)), // data offset
+                .init(value: dataLength),
+                .init(Self.name),
+                .init(value: 0 as UInt32), // reserved
                 .init(value: key),
                 .init(value: state.rawValue),
-                .init(value: parentKey != nil ? 0x0000_0004 : 0 as UInt32), // Flags
+                .init(value: isV2 ? 0x0000_0004 : 0 as UInt32), // LeaseFlags
                 .init(value: 0 as UInt64), // LeaseDuration
+            ] + (isV2 ? [
                 .init(value: parentKey ?? .zero),
                 .init(value: 4 as UInt16), // Epoch
                 .init(value: 0 as UInt16), // Reserved
-            ]
+            ] : [])
         }
-        
+
         init(state: LeaseState, key: UUID, parentKey: UUID? = nil) {
             self.state = state
             self.key = key

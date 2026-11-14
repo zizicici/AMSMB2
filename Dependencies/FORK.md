@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-3`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-4`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -30,6 +30,14 @@ the regression suites assume them.
   completion, so a reordered (info-first) reply still yields the right
   file type. This is what lets AMSMB2 call `smb2_fstat_async()` directly
   instead of hand-rolling two sequential queries.
+- `cfa6e9d` — POLLHUP no longer discards replies already sitting in the
+  socket buffer (the peer answering and hanging up in one burst reported
+  the operation as failed); the connect-stage POLLHUP completion tries
+  the next resolved address like POLLERR/POLLOUT; the encryption-abort
+  path guards against unbounded synchronous re-entry from callbacks; the
+  compound writev aggregation caps its iovec count; and all
+  allocation-failure paths of the stat/truncate/rename compounds complete
+  the caller with -ENOMEM.
 
 ## Syncing with upstream
 
@@ -53,3 +61,13 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 - fstat compound ordering:
   `SMB2FileStatTests/testFstatCompoundAppliesLateTagWhenInfoRepliesFirst`
   (mutation-checked against `fd9b7dd`).
+
+## Known upstream limitations (documented, not carried as patches)
+
+- A reply whose body never completes (half-received PDU in `smb2->pdu`)
+  escapes `smb2_timeout_pdus`'s queue scan; AMSMB2's `timeout + 2`
+  backstop covers its callers.
+- The Apple build config has no accelerated AES backend: SMB3
+  encryption/signing runs the portable C AES (~52 MB/s seal, ~100 MB/s
+  signing, measured on arm64). Fixing this needs CommonCrypto cryptor
+  reuse or armv8 crypto intrinsics.

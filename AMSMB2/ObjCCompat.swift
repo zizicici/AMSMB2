@@ -393,7 +393,14 @@ extension SMB2Manager {
             return
         }
 
-        let range = length >= 0 ? offset..<(offset + Int64(length)) : offset..<Int64.max
+        let upper: Int64
+        if length >= 0 {
+            let (sum, overflow) = offset.addingReportingOverflow(Int64(length))
+            upper = overflow ? Int64.max : sum
+        } else {
+            upper = Int64.max
+        }
+        let range = offset..<upper
         contents(
             atPath: path, range: range, progress: progress,
             completionHandler: convert(completionHandler)

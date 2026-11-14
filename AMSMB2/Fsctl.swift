@@ -116,9 +116,11 @@ extension IOCtl {
                 throw POSIXError(.invalidArgument, description: nil)
             }
             self.reparseTag = data.scanValue(offset: 0, as: UInt32.self) ?? SMB2_REPARSE_TAG_SYMLINK
-            
+
             let count = try data.scanInt(offset: 4, as: UInt16.self).unwrap()
-            guard count + 8 == data.count else { throw POSIXError(.invalidArgument, description: nil) }
+            // Servers may pad past the declared length; accept it like the C
+            // decoder does (it only requires the data to fit).
+            guard count + 8 <= data.count else { throw POSIXError(.invalidArgument, description: nil) }
             self.buffer = data.dropFirst(Int(Self.headerLength))
         }
     }
@@ -144,7 +146,10 @@ extension IOCtl {
                 throw POSIXError(.invalidArgument, description: nil)
             }
             let count = try data.scanInt(offset: 4, as: UInt16.self).unwrap()
-            guard count + 8 == data.count else { throw POSIXError(.invalidArgument, description: nil) }
+            // ReparseDataLength covers the fields from SubstituteNameOffset
+            // through the end of PathBuffer ([MS-FSCC] 2.1.2.4: "the size of
+            // the PathBuffer field plus 12"); padded buffers are accepted.
+            guard count + 8 <= data.count else { throw POSIXError(.invalidArgument, description: nil) }
 
             let substituteOffset = try data.scanInt(offset: 8, as: UInt16.self).unwrap()
             let substituteLen = try data.scanInt(offset: 10, as: UInt16.self).unwrap()
@@ -173,7 +178,10 @@ extension IOCtl {
             let printLen = UInt16(printData.count)
             return [
                 .init(value: reparseTag),
-                .init(value: UInt16(substituteData.count + printData.count)),
+                // ReparseDataLength: everything from SubstituteNameOffset to
+                // the end of PathBuffer, i.e. the 12 bytes of offset/length
+                // fields plus the buffer itself ([MS-FSCC] 2.1.2.4).
+                .init(value: UInt16(substituteData.count + printData.count + 12)),
                 .init(value: 0 as UInt16), // reserved
                 .init(value: 0 as UInt16), // substitute offset
                 .init(value: substituteLen),

@@ -1029,7 +1029,11 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     ) -> AsyncThrowingStream<Data, any Error> where R.Bound: FixedWidthInteger {
         let range = range?.int64Range ?? 0..<Int64.max
         let (result, continuation) = AsyncThrowingStream<Data, any Error>.makeStream(bufferingPolicy: .unbounded)
-        
+        let consumerGone = StreamConsumerGone()
+        continuation.onTermination = { _ in
+            consumerGone.set()
+        }
+
         queue { [client] in
             guard let client = client else {
                 // Never leave the consumer awaiting a stream that cannot
@@ -1043,7 +1047,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             do {
                 let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
                 try file.seek(offset: range.lowerBound, from: .start)
-                while offset < range.upperBound {
+                while offset < range.upperBound, !consumerGone.isGone {
                     // Read optimal read size, or less if less is remaining.
                     let remainingLength = range.upperBound - offset
                     let optimizedReadSize = file.optimizedReadSize
@@ -1526,9 +1530,11 @@ extension SMB2Manager {
         client.timeout = clientState.timeout
     }
 
-    private func connect(shareName: String, encrypted: Bool) throws -> SMB2Client {
+    private func connect(shareName: String, encrypted: Bool, publish: Bool = true) throws -> SMB2Client {
         let client = try SMB2Client()
-        self.setClient(client, encrypted: encrypted)
+        if publish {
+            self.setClient(client, encrypted: encrypted)
+        }
         initClient(client, encrypted: encrypted)
         let server = url.host! + (url.port.map { ":\($0)" } ?? "")
         try client.connect(server: server, share: shareName, user: _user)
@@ -1581,7 +1587,10 @@ extension SMB2Manager {
     ) {
         queue {
             do {
-                let client = try self.connect(shareName: shareName, encrypted: encrypted)
+                // An unpublished connection: the IPC$ client used for share
+                // enumeration must not clobber (and tear down) whatever share
+                // connection this manager is currently holding.
+                let client = try self.connect(shareName: shareName, encrypted: encrypted, publish: false)
                 defer { try? client.disconnect() }
 
                 let result = try handler(client)
@@ -1650,9 +1659,9 @@ extension SMB2Manager {
                 } else {
                     let bytes = try handle(
                         client, itemPath, destPath
-                    ) { [totalCopied] bytes, _, _ -> Int64? in
+                    ) { [totalCopied] bytes, soFar, _ -> Int64? in
                         if let progress {
-                            return progress(totalCopied + Int64(bytes), overallSize) ? bytes : nil
+                            return progress(totalCopied + soFar, overallSize) ? bytes : nil
                         } else {
                             return bytes
                         }
@@ -1832,5 +1841,25 @@ extension SMB2Manager {
         }
 
         try file.fsync()
+    }
+}
+
+
+/// Tracks whether the consumer of `contents(atPath:range:)`'s stream is
+/// still interested, so the producing loop can stop once it is terminated.
+final class StreamConsumerGone: @unchecked Sendable {
+    private let lock = NSLock()
+    private var gone = false
+
+    func set() {
+        lock.lock()
+        gone = true
+        lock.unlock()
+    }
+
+    var isGone: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return gone
     }
 }
