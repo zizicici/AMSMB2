@@ -367,7 +367,16 @@ extension SMB2Client {
         )
         defer { try? file.close() }
         let reparse = IOCtl.SymbolicLinkReparse(path: wireTarget, isRelative: !isAbsolute)
-        try file.fcntl(command: .setReparsePoint, args: reparse)
+        do {
+            try file.fcntl(command: .setReparsePoint, args: reparse)
+        } catch {
+            // The exclusive create above made this file; without reparse
+            // data it is an empty regular file, not a link. Mark it
+            // delete-on-close through the handle we still hold instead of
+            // leaving it behind (servers without reparse support fail here).
+            try? file.setInfo(smb2_file_disposition_info(delete_pending: 1), infoClass: .disposition)
+            throw error
+        }
     }
 }
 

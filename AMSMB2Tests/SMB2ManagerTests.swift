@@ -188,7 +188,15 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
     
     func testListing() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
+        // The assertions below need at least one entry; a fresh share can be
+        // empty, so create one (this test used to pass only when earlier
+        // runs or other agents had left files behind).
+        let seed = fileName()
+        addTeardownBlock {
+            try? await smb.removeFile(atPath: seed)
+        }
         try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.write(data: Data([0x01]), toPath: seed, progress: nil)
         let contents = try await smb.contentsOfDirectory(atPath: "/")
         XCTAssertFalse(contents.isEmpty)
         XCTAssertNotNil(contents.first)
@@ -213,6 +221,31 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         }
     }
     
+    func testCreateSymlinkFailureLeavesNoFile() async throws {
+        // createSymbolicLink creates the file first and then sets the
+        // reparse data. On a server without reparse-point support the
+        // second step fails, and the library used to leave the empty
+        // placeholder behind. No teardown removal here on purpose: the
+        // library itself must have cleaned up.
+        let smb = SMB2Manager(url: server, credential: credential)!
+        let link = fileName(postfix: "Residue")
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        do {
+            try await smb.createSymbolicLink(atPath: link, withDestinationPath: "nowhere")
+        } catch {
+            do {
+                _ = try await smb.attributesOfItem(atPath: link)
+                try? await smb.removeFile(atPath: link)
+                XCTFail("a failed createSymbolicLink left a file behind")
+            } catch {
+                // Expected: nothing exists at the path.
+            }
+            return
+        }
+        try? await smb.removeFile(atPath: link)
+        throw XCTSkip("This server supports reparse points; the failure path is not reachable here.")
+    }
+
     func testCreateSymlink() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
         let target = fileName(postfix: "Target")
@@ -665,8 +698,17 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         guard credential != nil else {
             throw XCTSkip("Set SMB_USER and SMB_PASSWORD to verify credential authentication.")
         }
+        // setenv is process-global: preserve and restore any pre-existing
+        // value instead of unconditionally unsetting it.
+        let previous = ProcessInfo.processInfo.environment["NTLM_USER_FILE"]
         setenv("NTLM_USER_FILE", "/dev/null", 1)
-        defer { unsetenv("NTLM_USER_FILE") }
+        defer {
+            if let previous {
+                setenv("NTLM_USER_FILE", previous, 1)
+            } else {
+                unsetenv("NTLM_USER_FILE")
+            }
+        }
         let smb = SMB2Manager(url: server, credential: credential)!
         try await smb.connectShare(name: share, encrypted: encrypted)
         try await smb.echo()

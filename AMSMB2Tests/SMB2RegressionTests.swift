@@ -416,6 +416,103 @@ final class SMB2RegressionTests: XCTestCase {
         XCTAssertEqual(try file.read(length: 64), Data(repeating: 0x41, count: 16))
     }
 
+    // MARK: the credit balance must never be multiplied into a request length
+
+    func test_NegativeCreditBalanceNeverInflatesQueuedRequests() throws {
+        // A server granting 65535 credits per reply used to walk the int
+        // balance negative; `count = credits * 65536` then produced a ~4 GiB
+        // Length that the server could answer into the caller's 64-byte
+        // buffer (read) or that shipped 4 GiB of the caller's memory (write)
+        // — libsmb2 fork amsmb2-fork-11. The balance is capped now (next
+        // test), but the clamp and the send gate must hold on their own:
+        // forge the negative balance and inspect what queues.
+        let (client, peer) = try makeClient()
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
+        buffer.initialize(repeating: 0x42, count: 64)
+        defer {
+            // Teardown completes the queued PDUs that still reference buffer.
+            client.destroyContext()
+            buffer.deallocate()
+            _ = close(peer)
+        }
+        let noop: smb2_command_cb = { _, _, _, _ in }
+        var fileId: smb2_file_id = UUID().uuid
+        try client.withThreadSafeContext { context in
+            context.pointee.credits = -1000
+            let handle = try smb2_fh_from_file_id(context, &fileId).unwrap()
+            XCTAssertEqual(smb2_pread_async(context, handle, buffer, 64, 0, noop, nil), 0)
+            XCTAssertEqual(smb2_pwrite_async(context, handle, buffer, 64, 0, noop, nil), 0)
+
+            // Nothing may reach the wire on a negative balance, so both
+            // requests are still queued. out.iov[1] is the fixed request
+            // body; Length sits at offset 4 for READ and WRITE alike.
+            var lengths: [UInt32] = []
+            var pdu = context.pointee.outqueue
+            while let current = pdu {
+                let body = withUnsafePointer(to: &current.pointee.out.iov) {
+                    $0.withMemoryRebound(to: smb2_iovec.self, capacity: 2) { $0[1] }
+                }
+                let raw = UnsafeRawPointer(try body.buf.unwrap())
+                lengths.append(UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: 4, as: UInt32.self)))
+                pdu = current.pointee.next
+            }
+            XCTAssertEqual(lengths, [64, 64], "both requests stay queued carrying the caller's length")
+        }
+    }
+
+    func test_CreditGrantsAreCappedAtMaxCredits() throws {
+        // The balance only ever grows by what replies grant; without a cap
+        // ~32k replies granting 65535 each overflow it. The client never
+        // asks for more than MAX_CREDITS in total, so cap it there.
+        let (client, peer) = try makeClient()
+        try client.withThreadSafeContext { $0.pointee.credits = 1000 }
+        let finished = expectation(description: "Granting peer finished")
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            do {
+                let request = try receivePacket(peer)
+                let count = 16
+                var header = response(for: request)
+                header.put(UInt16.max, at: 14) // CreditResponse: the largest possible grant
+                var body = Data(repeating: 0, count: 16)
+                body.put(UInt16(17), at: 0)
+                body[2] = 80
+                body.put(UInt32(count), at: 4)
+                var reply = header + body + Data(repeating: 0x41, count: count)
+                var length = UInt32(reply.count).bigEndian
+                reply = withUnsafeBytes(of: &length) { Data($0) } + reply
+                try sendAll(peer, reply)
+                var byte: UInt8 = 0
+                _ = recv(peer, &byte, 1, 0)
+            } catch {
+                XCTFail("Granting peer: \(error)")
+            }
+        }
+        defer {
+            client.destroyContext()
+            wait(for: [finished], timeout: 10)
+        }
+        let file = try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client)
+        XCTAssertEqual(try file.read(length: 64), Data(repeating: 0x41, count: 16))
+        let balance = try client.withThreadSafeContext { $0.pointee.credits }
+        XCTAssertEqual(balance, MAX_CREDITS, "1000 - 1 + 65535 must saturate at MAX_CREDITS")
+    }
+
+    // MARK: nonces and challenges come from a CSPRNG on every platform
+
+    func test_RandomBytesComeFromAStrongSource() {
+        // smb2_random_bytes() returns 0 when a strong source filled the
+        // buffer and -1 when it fell back to random() (~32 bits of
+        // guessable seed). The source is picked in include/apple/config.h:
+        // arc4random_buf on Darwin, getrandom/urandom on Linux.
+        var first = [UInt8](repeating: 0, count: 32)
+        var second = [UInt8](repeating: 0, count: 32)
+        XCTAssertEqual(smb2_random_bytes(&first, first.count), 0)
+        XCTAssertEqual(smb2_random_bytes(&second, second.count), 0)
+        XCTAssertNotEqual(first, second)
+        XCTAssertNotEqual(first, [UInt8](repeating: 0, count: 32))
+    }
+
     // MARK: teardown sweeps handles the caller never closed
 
     func test_DestroyContextSweepsUnclosedHandles() throws {

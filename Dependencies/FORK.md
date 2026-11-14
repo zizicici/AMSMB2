@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-10`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-11`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -36,7 +36,8 @@ the regression suites assume them.
   the next resolved address like POLLERR/POLLOUT; the compound writev
   aggregation caps its iovec count; and all allocation-failure paths of
   the stat/truncate/rename compounds complete the caller with -ENOMEM.
-- `6c5987e`/`7c0bfcd` — commands synchronously queued from inside an
+- `6c5987e`/`7c0bfcd` (revising the unbounded first cut `6576648`) —
+  commands synchronously queued from inside an
   encryption-abort callback are parked and completed iteratively (a
   bounded budget stops a pathological re-queueing callback; the parked
   error string is no longer overwritten), and the POLLHUP input drain is
@@ -62,17 +63,32 @@ the regression suites assume them.
   firing their callbacks: the earlier fire-before-free variant recursed
   without bound on retry-style callbacks (ASan measured a 27k-frame stack
   overflow); the bounded callback loss is the documented trade-off.
-- `2078fae` — `HAVE_ARC4RANDOM_BUF` is defined in the Apple config
-  (platform-gated: Darwin always, glibc ≥ 2.36), so `smb2_random_bytes()`
-  stops falling back to `random()` seeded with ~32 bits of guessable
-  material for the NTLMv2 client challenge, SMB 3.1.1 preauth salt, client
-  GUID and per-PDU nonces.
+- `2078fae` — `HAVE_ARC4RANDOM_BUF` is defined in the Apple config, so on
+  Darwin `smb2_random_bytes()` stops falling back to `random()` seeded
+  with ~32 bits of guessable material for the NTLMv2 client challenge,
+  SMB 3.1.1 preauth salt, client GUID and per-PDU nonces. Its glibc half
+  never took effect (see `bc5d2dd`).
 - `8262429` — the read/write count clamp is skipped when the negotiated
   size is zero ("not negotiated"): clamping to zero made the unsigned
   `(count - 1)` credit computation wrap, and an observed 64-byte write
   went on the wire as a 64 KiB payload read past the caller's buffer (the
   read path wrote past it). Reachable via a hostile server negotiating
   MaxRead/MaxWriteSize = 0.
+- `bc5d2dd` — the credit balance (an `int`) is capped at `MAX_CREDITS`
+  when grants arrive, never sent on when negative, and no longer
+  multiplied into the request length when non-positive. A server
+  granting 65535 per reply walked it negative in ~32k replies;
+  `count = credits * 65536` then produced a ~4 GiB read/write length
+  that the server could answer into the caller's small buffer
+  (out-of-bounds write, ASan-verified) or that shipped the caller's
+  memory. A zero balance used to queue a zero-length read that looked
+  like EOF once sent; it now asks for one credit's worth. The Linux
+  CSPRNG is selected by compiler-predefined macros (`getrandom` +
+  `/dev/urandom`): the `__GLIBC__` test `2078fae` used is always false
+  because this config is the first include of every translation unit,
+  and including `<features.h>` here would freeze the feature-test macros
+  before the sources define `_GNU_SOURCE`. Also corrects a QUERY_INFO
+  constant used in the query-directory bounds check (same value today).
 
 ## Syncing with upstream
 
@@ -100,10 +116,13 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
   `SMB2RegressionTests/test_{Read,Write}WithZeroNegotiatedSize…`
   (mutation-checked against `8262429`: reverted, the Length field on the
   wire is 65536 instead of 64).
-- Not covered by an automated test: `2078fae` (CSPRNG selection is only
-  visible in the binary — `nm` shows `_arc4random_buf` and no `_random`
-  reference from `smb2_random_bytes`), and the two suites noted as
-  backstop-masked below.
+- Credit balance: `SMB2RegressionTests/test_NegativeCreditBalanceNeverInflatesQueuedRequests`
+  and `test_CreditGrantsAreCappedAtMaxCredits` (mutation-checked against
+  `bc5d2dd`: clamp, send gate and cap each reverted on its own fail a
+  case).
+- CSPRNG: `SMB2RegressionTests/test_RandomBytesComeFromAStrongSource`
+  asserts `smb2_random_bytes()` reports a strong source; it fails on
+  Darwin without `2078fae` and on Linux (Docker) without `bc5d2dd`.
 
 ### Known weak locks
 
@@ -115,6 +134,17 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
   once with the malloc-zone probe described above.
 
 ## Known upstream limitations (documented, not carried as patches)
+
+- A READ issued with length 0 through the raw API skips the
+  "data_length <= asked" check (`smb2-cmd-read.c`, `if (pdu->in.niov)`);
+  the bytes land in an internal buffer, not the caller's. AMSMB2 never
+  issues zero-length reads.
+- The READ reply's DataOffset is read as 8 bits; a forged high byte is
+  ignored (the data is still taken from the stream position, bounded).
+- Hostile-server names: a FileName containing U+0000 is truncated by
+  `String(cString:)` on the Swift side, and names containing `\` are not
+  escaped when joined into paths. Both are name-confusion issues with a
+  malicious server, not memory-safety ones.
 
 - A reply whose body never completes (half-received PDU in `smb2->pdu`)
   escapes `smb2_timeout_pdus`'s queue scan; AMSMB2's `timeout + 2`

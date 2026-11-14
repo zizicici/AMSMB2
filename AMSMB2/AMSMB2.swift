@@ -1246,6 +1246,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
      - Important: Stream will be closed eventually if is not already opened when passed.
 
+     - Note: The library applies backpressure itself (at most ~4 MiB is buffered ahead of the
+         network), but an `AsyncThrowingStream` built with the default unbounded buffering policy
+         defeats it — `yield` never waits, so a fast producer accumulates unbounded memory in the
+         stream itself. Pass a bounded `bufferingPolicy` (or produce via `unfolding`) when the
+         producer can outrun the network.
+
      - Parameters:
        - stream: input stream that provides data to be written to file.
        - toPath: path of file to be written.
@@ -1276,6 +1282,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      - Note: Data saved in server maybe truncated when an error is thrown.
 
      - Important: Stream will be closed eventually if is not already opened when passed.
+
+     - Note: The library applies backpressure itself (at most ~4 MiB is buffered ahead of the
+         network), but an `AsyncThrowingStream` built with the default unbounded buffering policy
+         defeats it — `yield` never waits, so a fast producer accumulates unbounded memory in the
+         stream itself. Pass a bounded `bufferingPolicy` (or produce via `unfolding`) when the
+         producer can outrun the network.
 
      - Parameters:
        - stream: input stream that provides data to be written to file.
@@ -1601,6 +1613,15 @@ extension SMB2Manager {
             client.seal = true
         }
 
+        // Ordering contract with libsmb2, do not reshuffle:
+        // - smb2_set_domain()/smb2_set_user() re-read NTLM_USER_FILE for any
+        //   non-NULL argument — including empty strings — and clear the
+        //   password when no entry matches. The password is therefore set
+        //   LAST so it always survives.
+        // - The domain must be set even when empty: an unset (NULL) domain
+        //   makes the NTLM challenge handler adopt the server's target name
+        //   and re-read NTLM_USER_FILE mid-handshake (ntlmssp.c), which can
+        //   clear the password during authentication.
         client.domain = _domain
         client.workstation = _workstation
         client.user = _user
