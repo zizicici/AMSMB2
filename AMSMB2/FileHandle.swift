@@ -345,6 +345,12 @@ final class SMB2FileHandle: @unchecked Sendable {
                         SMB2Client.generic_handler, cbPtr
                     )
                 }
+                // A server that accepts a non-empty Write but reports zero
+                // bytes written would spin this loop forever (each round
+                // trip satisfies the timeout); treat it as an error.
+                guard result > 0 else {
+                    throw POSIXError(.ioError, description: "Server reported zero bytes written.")
+                }
                 written += Int(result)
             }
         }
@@ -360,12 +366,18 @@ final class SMB2FileHandle: @unchecked Sendable {
         var written = 0
         try Data(data).withUnsafeBytes { buffer in
             while written < buffer.count {
+                guard offset <= UInt64.max - UInt64(written) else {
+                    throw POSIXError(.invalidArgument, description: "Write offset overflows.")
+                }
                 let base = buffer.baseAddress!.advanced(by: written)
                 let result = try client.async_await { context, cbPtr -> Int32 in
                     smb2_pwrite_async(
                         context, handle, base, .init(buffer.count - written),
                         offset + UInt64(written), SMB2Client.generic_handler, cbPtr
                     )
+                }
+                guard result > 0 else {
+                    throw POSIXError(.ioError, description: "Server reported zero bytes written.")
                 }
                 written += Int(result)
             }

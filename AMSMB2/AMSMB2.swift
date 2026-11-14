@@ -549,6 +549,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 // `libsmb2` can not read symlink attributes using `stat`, so if we get
                 // the related error, we simply open file as reparse point then use `fstat`.
                 let file = try SMB2FileHandle(path: path, .readOnly, options: .symlink, on: client)
+                defer { try? file.close() }
                 stat = try file.fstat()
             }
             var result = [URLResourceKey: any Sendable]()
@@ -646,6 +647,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         
         with(completionHandler: completionHandler) { [stat, smb2Attributes] client in
             let file = try SMB2FileHandle(forUpdatingAtPath: path, on: client)
+            defer { try? file.close() }
             try file.set(stat: stat, attributes: smb2Attributes)
         }
     }
@@ -834,6 +836,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 // `libsmb2` can not read symlink attributes using `stat`, so if we get
                 // the related error, we simply open file as reparse point then use `fstat`.
                 let file = try SMB2FileHandle(path: path, .readOnly, options: .symlink, on: client)
+                defer { try? file.close() }
                 stat = try file.fstat()
             }
             switch stat.resourceType {
@@ -1016,6 +1019,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     ) {
         with(completionHandler: completionHandler) { client in
             let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
+            defer { try? file.close() }
             let size = Int64(clamping: try file.fstat().smb2_size)
 
             var shouldContinue = true
@@ -1080,6 +1084,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             var offset = range.lowerBound
             do {
                 let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
+                defer { try? file.close() }
                 try file.seek(offset: range.lowerBound, from: .start)
                 while offset < range.upperBound, !consumerGone.isGone {
                     // Read optimal read size, or less if less is remaining.
@@ -1521,6 +1526,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 break
             }
             let file = try SMB2FileHandle(path: path, .readOnly, options: options, on: client)
+            defer { try? file.close() }
             return try file.changeNotify(for: filter)
         }
     }
@@ -1693,8 +1699,13 @@ extension SMB2Manager {
             var totalCopied: Int64 = 0
             for item in list {
                 let itemPath = try item.path.unwrap()
-                let destPath = itemPath.trimmedPath
-                    .replacingOccurrences(of: path, with: toPath, options: .anchored)
+                // Trim the source root: with a trailing slash the anchored
+                // replace produced "dest" + "file" instead of "dest/file".
+                let sourceRoot = path.trimmedPath + "/"
+                let destRoot = toPath.trimmedPath + "/"
+                let destPath = itemPath.hasPrefix(sourceRoot)
+                    ? destRoot + itemPath.dropFirst(sourceRoot.count)
+                    : itemPath.replacingOccurrences(of: path, with: toPath, options: .anchored)
                 if item.isDirectory {
                     try client.mkdir(destPath)
                 } else {
@@ -1731,12 +1742,14 @@ extension SMB2Manager {
         client: SMB2Client, fromPath path: String, toPath: String, progress: CopyProgressHandler
     ) throws -> Int64? {
         let fileSource = try SMB2FileHandle(forReadingAtPath: path, on: client)
+        defer { try? fileSource.close() }
         let size = Int64(clamping: try fileSource.fstat().smb2_size)
         let sourceKey = try fileSource.requestResumeKey()
         // MS-SMB2 caps a single SRV_COPYCHUNK at 1 MiB regardless of the
         // negotiated write size.
         let chunkSize = min(max(1, fileSource.optimizedWriteSize), 1_048_576)
         let fileDest = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
+        defer { try? fileDest.close() }
         var shouldContinue = true
         var offset: UInt64 = 0
         while offset < UInt64(size) {
@@ -1765,21 +1778,27 @@ extension SMB2Manager {
         client: SMB2Client, fromPath path: String, toPath: String, progress: CopyProgressHandler
     ) throws -> Int64? {
         let fileRead = try SMB2FileHandle(forReadingAtPath: path, on: client)
+        defer { try? fileRead.close() }
         let size = Int64(clamping: try fileRead.fstat().smb2_size)
         let fileWrite = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
-        var shouldContinue = true
+        defer { try? fileWrite.close() }
+        // EOF ("copied everything") and a progress cancellation must be told
+        // apart: returning nil on EOF made the recursive copier stop after
+        // the first file while reporting success.
+        var cancelled = false
         var written = 0
-        while shouldContinue {
+        while true {
             let data = try fileRead.read()
+            if data.isEmpty { break }
             written += try fileWrite.write(data: data)
             let offset = try fileRead.seek(offset: 0, from: .current)
-            if let progress {
-                shouldContinue = progress(Int64(written), offset, size) != nil
+            if let progress, progress(Int64(written), offset, size) == nil {
+                cancelled = true
+                break
             }
-            shouldContinue = shouldContinue && !data.isEmpty
         }
         try fileWrite.fsync()
-        return shouldContinue ? Int64(written) : nil
+        return cancelled ? nil : Int64(written)
     }
 
     private func removeDirectory(client: SMB2Client, path: String, recursive: Bool) throws {
@@ -1810,6 +1829,7 @@ extension SMB2Manager {
         to stream: OutputStream, progress: ReadProgressHandler
     ) throws {
         let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
+        defer { try? file.close() }
         let filesize = Int64(clamping: try file.fstat().smb2_size)
         // Both operands are non-negative here (int64Range clamps negative
         // lower bounds to 0), so the subtraction cannot overflow.
@@ -1862,6 +1882,7 @@ extension SMB2Manager {
         let chunkSize = min(chunkSize > 0 ? chunkSize : max(1, file.optimizedWriteSize), 16 << 20)
         var totalWritten: UInt64 = 0
 
+        defer { try? file.close() }
         try stream.withOpenStream {
             while true {
                 let segment = try stream.readData(maxLength: chunkSize)

@@ -30,7 +30,7 @@ extension Array where Element == SMB2Share {
             self = []
             return
         }
-        self = (0..<Int(reply.entries_read)).map { index in
+        self = (0..<Int(clamping: reply.entries_read)).map { index in
             SMB2Share(
                 // NDR unique pointers are legally NULL for empty name/remark.
                 name: info[index].netname.map { String(cString: $0) } ?? "",
@@ -116,7 +116,7 @@ extension DecodableResponse {
         default:
             decodedLength = Int(clamping: reply.output_count)
         }
-        let length = min(decodedLength, Int(reply.output_count))
+        let length = min(decodedLength, Int(clamping: reply.output_count))
 // Check memory validity in order to prevent crash on invalid pointers.
 // Best-effort only: msync() can also fail with ENOMEM for a buffer that ends
 // on the final page of a mapping, in which case a legitimate (but truncated)

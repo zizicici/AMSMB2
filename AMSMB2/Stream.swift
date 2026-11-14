@@ -292,12 +292,14 @@ public class AsyncInputStream<Seq>: InputStream, @unchecked Sendable where Seq: 
             while true {
                 do {
                     guard let data = try await iterator.next() else { break }
-                    guard let self else { return }
-                    let chunk = Data(data)
-                    while !self.prefetchHasSpace(for: chunk.count) {
+                    spaceWait: while true {
+                        guard let self else { return }
+                        if self.prefetchHasSpace(for: Data(data).count) { break spaceWait }
                         guard !self.prefetchIsClosed() else { return }
                         try? await Task.sleep(nanoseconds: 20_000_000)
                     }
+                    guard let self else { return }
+                    let chunk = Data(data)
                     guard self.prefetchAppend(chunk) else { return }
                 } catch {
                     guard let self else { return }
