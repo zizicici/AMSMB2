@@ -23,9 +23,8 @@ swift test --filter SMB2ManagerTests/testName
 # AddressSanitizer regression guard (see Dependencies/FORK.md)
 make asan-test
 
-# Linux testing via Docker
-make cleanlinuxtest         # Clean Docker build (the reliable path)
-make linuxtest              # Volume-mount variant; may shadow the image tree
+# Linux testing via Docker (self-contained image, swift:6.1)
+make cleanlinuxtest
 ```
 
 ## Architecture
@@ -47,7 +46,8 @@ make linuxtest              # Volume-mount variant; may shadow the image tree
 
 ### Dependencies
 
-- **libsmb2** - C library in `Dependencies/libsmb2/`, compiled as a Swift package target
+- **libsmb2** - C library in `Dependencies/libsmb2/` (git submodule pinning the fork, see `Dependencies/FORK.md`), compiled as a Swift package target
+- **swift-system** - `SystemPackage` on non-Darwin platforms (Darwin uses the SDK's `System`)
 - **swift-atomics** - Used in tests only
 
 ## Code Style
