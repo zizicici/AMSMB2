@@ -83,23 +83,24 @@ final class SMB2FileStatTests: XCTestCase {
         XCTAssertEqual(stat.resourceType, .directory)
     }
 
-    func testFstatQueriesRegularFileWithoutCompound() throws {
-        try withStatPeer(replies: [.all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_ARCHIVE))]) { file in
+    func testFstatCompoundClassifiesInOrder() throws {
+        try withStatPeer(replies: [tagReply(), .all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT))]) { file in
             let stat = try file.fstat()
+            XCTAssertEqual(stat.resourceType, .link)
+            XCTAssertEqual(stat.smb2_reparse_tag, UInt32(SMB2_REPARSE_TAG_SYMLINK))
             XCTAssertEqual(stat.smb2_size, 5_000_000_000)
             XCTAssertEqual(stat.smb2_ino, 42)
-            XCTAssertEqual(stat.resourceType, .file)
         }
     }
 
-    func testFstatQueriesReparseTagAfterFileInfo() throws {
-        var tag = Data(repeating: 0, count: 8)
-        tag.put(UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT), at: 0)
-        tag.put(UInt32(SMB2_REPARSE_TAG_SYMLINK), at: 4)
-        try withStatPeer(replies: [
-            .all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT)),
-            StatReply(infoClass: UInt8(SMB2_FILE_ATTRIBUTE_TAG_INFORMATION), output: tag),
-        ]) { file in
+    func testFstatCompoundAppliesLateTagWhenInfoRepliesFirst() throws {
+        // The fstat compound is unrelated, so the server may reorder the
+        // replies: the info reply first, the attribute tag late. The tag
+        // must still be applied at completion.
+        try withStatPeer(
+            replies: [tagReply(), .all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT))],
+            reverseReplyOrder: true
+        ) { file in
             let stat = try file.fstat()
             XCTAssertEqual(stat.resourceType, .link)
             XCTAssertEqual(stat.smb2_reparse_tag, UInt32(SMB2_REPARSE_TAG_SYMLINK))
@@ -108,9 +109,9 @@ final class SMB2FileStatTests: XCTestCase {
 
     func testFstatFallsBackWhenTagQueryIsUnsupported() throws {
         try withStatPeer(replies: [
-            .all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT)),
             StatReply(infoClass: UInt8(SMB2_FILE_ATTRIBUTE_TAG_INFORMATION),
                       status: UInt32(SMB2_STATUS_INVALID_INFO_CLASS)),
+            .all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT)),
         ]) { file in
             let stat = try file.fstat()
             XCTAssertEqual(stat.resourceType, .link)
@@ -119,28 +120,58 @@ final class SMB2FileStatTests: XCTestCase {
         }
     }
 
+    func testFstatRegularFileIgnoresTag() throws {
+        try withStatPeer(replies: [
+            tagReply(),
+            .all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_ARCHIVE)),
+        ]) { file in
+            let stat = try file.fstat()
+            XCTAssertEqual(stat.resourceType, .file)
+            XCTAssertEqual(stat.smb2_reparse_tag, 0)
+        }
+    }
+
     func testFstatRejectsEmptyFileInfoReply() throws {
-        try withStatPeer(replies: [StatReply(infoClass: UInt8(SMB2_FILE_ALL_INFORMATION))]) { file in
+        try withStatPeer(replies: [
+            tagReply(),
+            StatReply(infoClass: UInt8(SMB2_FILE_ALL_INFORMATION)),
+        ]) { file in
             XCTAssertThrowsError(try file.fstat()) { error in
                 XCTAssertEqual((error as? POSIXError)?.code, .EIO)
             }
         }
     }
 
-    func testFstatDoesNotHideTagTimeout() throws {
-        try withStatPeer(replies: [
-            .all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT)),
-            StatReply(infoClass: UInt8(SMB2_FILE_ATTRIBUTE_TAG_INFORMATION),
-                      status: UInt32(SMB2_STATUS_IO_TIMEOUT)),
-        ]) { file in
-            XCTAssertThrowsError(try file.fstat()) { error in
-                XCTAssertEqual((error as? POSIXError)?.code, .ETIMEDOUT)
-            }
+    func testFstatTagTimeoutFallsBack() throws {
+        // The tag query is optional in the compound: when it never gets a
+        // reply, its PDU timeout completes it and fstat still succeeds with
+        // the tag-less fallback (the connection is torn down by the timeout).
+        try withStatPeer(
+            replies: [nil, .all(attributes: UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT))],
+            expectsClose: false
+        ) { file in
+            let stat = try file.fstat()
+            XCTAssertEqual(stat.resourceType, .link)
+            XCTAssertEqual(stat.smb2_reparse_tag, 0)
         }
     }
 
+    private func tagReply() -> StatReply {
+        var tag = Data(repeating: 0, count: 8)
+        tag.put(UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT), at: 0)
+        tag.put(UInt32(SMB2_REPARSE_TAG_SYMLINK), at: 4)
+        return StatReply(infoClass: UInt8(SMB2_FILE_ATTRIBUTE_TAG_INFORMATION), output: tag)
+    }
+
+    /// Speaks the fstat compound: one chained request packet carrying the
+    /// attribute-tag and all-info queries, answered per member (optionally in
+    /// reverse order), then a CLOSE unless the caller expects the teardown
+    /// path. `replies` are in chain order; nil never answers that member.
     private func withStatPeer(
-        replies: [StatReply], check: (SMB2FileHandle) throws -> Void
+        replies: [StatReply?],
+        reverseReplyOrder: Bool = false,
+        expectsClose: Bool = true,
+        check: (SMB2FileHandle) throws -> Void
     ) throws {
         var sockets: [Int32] = [-1, -1]
 #if canImport(Darwin)
@@ -152,7 +183,7 @@ final class SMB2FileStatTests: XCTestCase {
         guard sockets[0] >= 0 else { throw POSIXError(.EIO) }
         XCTAssertEqual(fcntl(sockets[0], F_SETFL, O_NONBLOCK), 0)
         let peerFD = sockets[1]
-        var deadline = timeval(tv_sec: 3, tv_usec: 0)
+        var deadline = timeval(tv_sec: 8, tv_usec: 0)
         _ = setsockopt(peerFD, SOL_SOCKET, SO_RCVTIMEO, &deadline, socklen_t(MemoryLayout<timeval>.size))
 #if canImport(Darwin)
         var noSignal: Int32 = 1
@@ -165,19 +196,40 @@ final class SMB2FileStatTests: XCTestCase {
                 finished.fulfill()
             }
             do {
-                for reply in replies {
-                    let request = try receivePacket(peerFD)
-                    XCTAssertEqual(request.integer(at: 12, as: UInt16.self), UInt16(SMB2_QUERY_INFO.rawValue))
-                    // Independent requests cannot expose the C compound callback ordering bug.
-                    XCTAssertEqual(request.integer(at: 20, as: UInt32.self), 0)
-                    XCTAssertEqual(request[67], reply.infoClass)
-                    try sendPacket(peerFD, reply.packet(for: request))
+                let packet = try receivePacket(peerFD)
+                var members = [Data]()
+                var slice = packet
+                while true {
+                    members.append(slice)
+                    let next = slice.integer(at: 20, as: UInt32.self)
+                    if next == 0 || next >= slice.count { break }
+                    slice = slice.subdata(in: Int(next)..<slice.count)
                 }
-                let request = try receivePacket(peerFD)
-                XCTAssertEqual(request.integer(at: 12, as: UInt16.self), UInt16(SMB2_CLOSE.rawValue))
-                var body = Data(repeating: 0, count: 60)
-                body.put(UInt16(60), at: 0)
-                try sendPacket(peerFD, responseHeader(for: request) + body)
+                XCTAssertEqual(members.count, 2, "fstat sends one compound with two queries")
+                XCTAssertEqual(members[0].integer(at: 12, as: UInt16.self), UInt16(SMB2_QUERY_INFO.rawValue))
+                XCTAssertEqual(members[1].integer(at: 12, as: UInt16.self), UInt16(SMB2_QUERY_INFO.rawValue))
+                XCTAssertGreaterThan(members[0].integer(at: 20, as: UInt32.self), 0, "chained via NextCommand")
+                XCTAssertEqual(members[1].integer(at: 20, as: UInt32.self), 0)
+                XCTAssertEqual(members[0][67], UInt8(SMB2_FILE_ATTRIBUTE_TAG_INFORMATION))
+                XCTAssertEqual(members[1][67], UInt8(SMB2_FILE_ALL_INFORMATION))
+
+                var order = [Int](replies.indices)
+                if reverseReplyOrder { order.reverse() }
+                for index in order {
+                    guard let reply = replies[index] else { continue }
+                    try sendPacket(peerFD, reply.packet(for: members[index]))
+                }
+
+                if expectsClose {
+                    let request = try receivePacket(peerFD)
+                    XCTAssertEqual(request.integer(at: 12, as: UInt16.self), UInt16(SMB2_CLOSE.rawValue))
+                    var body = Data(repeating: 0, count: 60)
+                    body.put(UInt16(60), at: 0)
+                    try sendPacket(peerFD, responseHeader(for: request) + body)
+                } else {
+                    var byte: UInt8 = 0
+                    XCTAssertEqual(recv(peerFD, &byte, 1, 0), 0, "client must tear the connection down")
+                }
             } catch {
                 XCTFail("SMB query peer failed: \(error)")
             }
@@ -195,7 +247,7 @@ final class SMB2FileStatTests: XCTestCase {
         defer {
             try? file.close()
             client.destroyContext()
-            wait(for: [finished], timeout: 5)
+            wait(for: [finished], timeout: 8)
         }
         try check(file)
     }

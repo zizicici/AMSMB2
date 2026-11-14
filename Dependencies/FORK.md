@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-2`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-3`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -26,6 +26,10 @@ the regression suites assume them.
   per-context lists, restoring its documented contract (verified with a
   malloc-zone probe: 100 unclosed handles, 98 blocks leaked before, none
   after).
+- `4086bb7` — the fstat compound applies the final attribute-tag at
+  completion, so a reordered (info-first) reply still yields the right
+  file type. This is what lets AMSMB2 call `smb2_fstat_async()` directly
+  instead of hand-rolling two sequential queries.
 
 ## Syncing with upstream
 
@@ -46,3 +50,6 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 - Queue-time abort: `SMB2RegressionTests/test_StatWithSealButNoKeyFailsFast`.
 - Refused connect: `SMB2RegressionTests/test_ConnectRefusedSurfacesConnectionRefused`.
 - Handle sweep: `SMB2RegressionTests/test_DestroyContextSweepsUnclosedHandles`.
+- fstat compound ordering:
+  `SMB2FileStatTests/testFstatCompoundAppliesLateTagWhenInfoRepliesFirst`
+  (mutation-checked against `fd9b7dd`).

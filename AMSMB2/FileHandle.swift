@@ -202,52 +202,14 @@ final class SMB2FileHandle: @unchecked Sendable {
     }
 
     func fstat() throws -> smb2_stat_64 {
-        // Avoid smb2_fstat_async's unrelated compound: its callbacks share state
-        // that is freed too early when the server returns the queries out of order.
-        var st = try queryInfo(infoClass: .all) { output in
-            smb2_stat_64(fileInfo: output.assumingMemoryBound(to: smb2_file_all_info.self).pointee)
-        }
-        if st.smb2_attributes & UInt32(SMB2_FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-            // As in libsmb2, the tag query is optional: older servers may reject
-            // this info class. An unknown reparse point retains the link fallback.
-            var tag: UInt32 = 0
-            do {
-                tag = try queryInfo(infoClass: .attributeTag) { output in
-                    output.assumingMemoryBound(to: smb2_file_attribute_tag_info.self).pointee.reparse_tag
-                }
-            } catch {
-                // A rejected optional info class may fall back; a lost connection
-                // or timeout must still fail the operation.
-                if !client.isActive || (error as? POSIXError)?.code == .ETIMEDOUT {
-                    throw error
-                }
-            }
-            st.setResourceType(reparseTag: tag)
+        // The C compound is safe since the fork's pending-refcount fix: any
+        // reply order completes exactly once, and a late attribute-tag reply
+        // is applied at completion, so the file type is always final.
+        var st = smb2_stat_64()
+        try client.async_await { context, cbPtr -> Int32 in
+            smb2_fstat_async(context, try handle.unwrap(), &st, SMB2Client.generic_handler, cbPtr)
         }
         return st
-    }
-
-    private func queryInfo<R>(
-        infoClass: InfoClass, decode: @escaping (UnsafeMutableRawPointer) throws -> R
-    ) throws -> R {
-        try client.withThreadSafeContext { _ in
-            let fileID = try smb2_get_file_id(handle.unwrap()).unwrap().pointee
-            return try client.async_await_pdu(dataHandler: { client, ptr in
-                let reply = try ptr.unwrap().assumingMemoryBound(to: smb2_query_info_reply.self).pointee
-                guard let output = reply.output_buffer else {
-                    throw POSIXError(.ioError, description: "Query info reply has no data.")
-                }
-                defer { try? client.withThreadSafeContext { smb2_free_data($0, output) } }
-                return try decode(output)
-            }) { context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
-                var req = smb2_query_info_request()
-                req.info_type = InfoType.file.rawValue
-                req.file_info_class = infoClass.rawValue
-                req.output_buffer_length = UInt32(min(65_535, client.maximumTransactionSize))
-                req.file_id = fileID
-                return smb2_cmd_query_info_async(context, &req, SMB2Client.generic_handler, cbPtr)
-            }.data
-        }
     }
     
     func setInfo<T>(_ value: T, type: InfoType = .file, infoClass: InfoClass) throws {
