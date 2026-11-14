@@ -340,6 +340,82 @@ final class SMB2RegressionTests: XCTestCase {
         }
     }
 
+    // MARK: a zero negotiated size must not wrap the request count
+
+    func test_WriteWithZeroNegotiatedSizeSendsExactlyTheCallerBytes() throws {
+        // max_write_size == 0 (unnegotiated context, or a hostile server
+        // negotiating zero) used to clamp count to 0; the unsigned
+        // (count - 1) credit computation then wrapped and tens of KiB read
+        // past the caller's buffer went on the wire (libsmb2 fork 8262429).
+        let (client, peer) = try makeClient()
+        try client.withThreadSafeContext { $0.pointee.max_write_size = 0 }
+        let finished = expectation(description: "Zero-size write peer finished")
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            do {
+                let prefix = try receiveAll(peer, 4)
+                let declared = prefix.reduce(0) { ($0 << 8) | Int($1) }
+                XCTAssertEqual(declared, 64 + 112, "header + fixed body + exactly the 64 payload bytes")
+                guard declared >= 64 + 48, declared <= 8 << 20 else { return }
+                let request = try receiveAll(peer, declared)
+                XCTAssertEqual(request.number(at: 12, UInt16.self), UInt16(SMB2_WRITE.rawValue))
+                XCTAssertEqual(request.number(at: 64 + 4, UInt32.self), 64, "Write Length field")
+                var body = Data(repeating: 0, count: 16)
+                body.put(UInt16(17), at: 0) // struct_size
+                body.put(UInt32(64), at: 4) // count
+                var reply = response(for: request) + body
+                var length = UInt32(reply.count).bigEndian
+                reply = withUnsafeBytes(of: &length) { Data($0) } + reply
+                try sendAll(peer, reply)
+                var byte: UInt8 = 0
+                _ = recv(peer, &byte, 1, 0)
+            } catch {
+                XCTFail("Zero-size write peer: \(error)")
+            }
+        }
+        defer {
+            client.destroyContext()
+            wait(for: [finished], timeout: 10)
+        }
+        let file = try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client)
+        XCTAssertEqual(try file.write(data: Data(repeating: 0x42, count: 64)), 64)
+    }
+
+    func test_ReadWithZeroNegotiatedSizeRequestsExactlyTheCallerLength() throws {
+        // Same wrap on the read path, where it is worse: the inflated
+        // Length lets the server answer with more than the caller's buffer.
+        let (client, peer) = try makeClient()
+        try client.withThreadSafeContext { $0.pointee.max_read_size = 0 }
+        let finished = expectation(description: "Zero-size read peer finished")
+        DispatchQueue.global().async {
+            defer { _ = close(peer); finished.fulfill() }
+            do {
+                let request = try receivePacket(peer)
+                XCTAssertEqual(request.number(at: 12, UInt16.self), UInt16(SMB2_READ.rawValue))
+                XCTAssertEqual(request.number(at: 64 + 4, UInt32.self), 64, "Read Length field")
+                let count = 16
+                var body = Data(repeating: 0, count: 16)
+                body.put(UInt16(17), at: 0)
+                body[2] = 80
+                body.put(UInt32(count), at: 4)
+                var reply = response(for: request) + body + Data(repeating: 0x41, count: count)
+                var length = UInt32(reply.count).bigEndian
+                reply = withUnsafeBytes(of: &length) { Data($0) } + reply
+                try sendAll(peer, reply)
+                var byte: UInt8 = 0
+                _ = recv(peer, &byte, 1, 0)
+            } catch {
+                XCTFail("Zero-size read peer: \(error)")
+            }
+        }
+        defer {
+            client.destroyContext()
+            wait(for: [finished], timeout: 10)
+        }
+        let file = try SMB2FileHandle(fileDescriptor: UUID().uuid, on: client)
+        XCTAssertEqual(try file.read(length: 64), Data(repeating: 0x41, count: 16))
+    }
+
     // MARK: teardown sweeps handles the caller never closed
 
     func test_DestroyContextSweepsUnclosedHandles() throws {

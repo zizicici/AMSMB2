@@ -96,6 +96,23 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 - fstat compound ordering:
   `SMB2FileStatTests/testFstatCompoundAppliesLateTagWhenInfoRepliesFirst`
   (mutation-checked against `4086bb7`).
+- Zero negotiated size:
+  `SMB2RegressionTests/test_{Read,Write}WithZeroNegotiatedSize…`
+  (mutation-checked against `8262429`: reverted, the Length field on the
+  wire is 65536 instead of 64).
+- Not covered by an automated test: `2078fae` (CSPRNG selection is only
+  visible in the binary — `nm` shows `_arc4random_buf` and no `_random`
+  reference from `smb2_random_bytes`), and the two suites noted as
+  backstop-masked below.
+
+### Known weak locks
+
+- The compound-timeout cases pass even with `smb2_timeout_pdus()` stubbed
+  out: AMSMB2's `timeout + 2` Swift backstop produces the same ETIMEDOUT.
+  They guard against the use-after-free under ASan, not the C fan-out.
+- `test_DestroyContextSweepsUnclosedHandles` passes with the sweep loop
+  removed (macOS has no LeakSanitizer); the sweep itself was verified
+  once with the malloc-zone probe described above.
 
 ## Known upstream limitations (documented, not carried as patches)
 
