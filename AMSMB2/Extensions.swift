@@ -152,7 +152,10 @@ extension Array where Element == [URLResourceKey: any Sendable] {
     var overallSize: Int64 {
         reduce(0) { result, value -> Int64 in
             guard value.isRegularFile else { return result }
-            return result + (value.fileSize ?? 0)
+            // Saturate instead of trapping: two fabricated >4EiB sizes from
+            // a malicious listing would otherwise crash the caller.
+            let (sum, overflow) = result.addingReportingOverflow(value.fileSize ?? 0)
+            return overflow ? Int64.max : sum
         }
     }
 }
@@ -177,12 +180,14 @@ extension RangeExpression where Bound: FixedWidthInteger {
         // to mean "the whole file".
         let lower: Int64
         let upper: Int64
+        // Negative lower bounds have no file-offset meaning; clamp them to 0
+        // so downstream seek/length arithmetic stays in non-negative Int64.
         switch self {
         case let range as Range<Bound>:
-            lower = Int64(clamping: range.lowerBound)
+            lower = max(0, Int64(clamping: range.lowerBound))
             upper = Int64(clamping: range.upperBound)
         case let range as ClosedRange<Bound>:
-            lower = Int64(clamping: range.lowerBound)
+            lower = max(0, Int64(clamping: range.lowerBound))
             // The inclusive-to-exclusive conversion needs upperBound + 1;
             // that is only unrepresentable when the bound's Int64 value is
             // already saturated (e.g. 0...Int64.max). Narrow bounds such as
@@ -191,7 +196,7 @@ extension RangeExpression where Bound: FixedWidthInteger {
                 ? Int64.max
                 : Int64(clamping: range.upperBound) + 1
         case let range as PartialRangeFrom<Bound>:
-            lower = Int64(clamping: range.lowerBound)
+            lower = max(0, Int64(clamping: range.lowerBound))
             upper = Int64.max
         case let range as PartialRangeUpTo<Bound>:
             lower = 0

@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-5`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-6`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -41,6 +41,14 @@ the regression suites assume them.
   bounded budget stops a pathological re-queueing callback; the parked
   error string is no longer overwritten), and the POLLHUP input drain is
   skipped while still connecting.
+- `59d67cd` — the parking list honors the documented cancel-by-free
+  contract (`smb2_free_pdu` unlinks parked chains; the sync wrappers'
+  pending check covers them; teardown drains them inside the main queue
+  loop), and directory replies whose NextEntryOffset steps overlap
+  entries (min 80-byte fixed part enforced) can no longer amplify one
+  heap allocation per few wire bytes.
+- merge of upstream `177a9de` — pre-1970 FILETIMEs decode to negative
+  seconds, matching what the Swift decode layer already assumed.
 
 ## Syncing with upstream
 
@@ -63,9 +71,16 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 - Handle sweep: `SMB2RegressionTests/test_DestroyContextSweepsUnclosedHandles`.
 - fstat compound ordering:
   `SMB2FileStatTests/testFstatCompoundAppliesLateTagWhenInfoRepliesFirst`
-  (mutation-checked against `fd9b7dd`).
+  (mutation-checked against `4086bb7`).
 
 ## Known upstream limitations (documented, not carried as patches)
+
+- The Apple build config lacks `HAVE_COMMONCRYPTO_COMMONCRYPTOR_H`
+  (upstream only defines it via CMake), so AES falls back to the portable
+  C reference even though `aes_apple.c` is compiled in (verified by `nm`:
+  zero symbols). Defining it in Package.swift may not help much on its
+  own — that backend creates/releases a cryptor per 16-byte block; real
+  gains need cryptor reuse (cf. upstream issue #500).
 
 - A reply whose body never completes (half-received PDU in `smb2->pdu`)
   escapes `smb2_timeout_pdus`'s queue scan; AMSMB2's `timeout + 2`

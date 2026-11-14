@@ -738,4 +738,78 @@ final class SMB2ManagerCodingTests: XCTestCase {
         let smbCopy = smb.copy() as! SMB2Manager
         XCTAssertEqual(smb.url, smbCopy.url)
     }
+
+    /// Codable/NSCoding/copy must preserve every credential field and a
+    /// non-default timeout — historically these were only checked for url.
+    private func fidelityRoundTrip(_ make: () -> SMB2Manager?) throws {
+        let original = try XCTUnwrap(make())
+        original.timeout = 77
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys] // key order is otherwise nondeterministic
+        let json = try encoder.encode(original)
+        let decoded = try JSONDecoder().decode(SMB2Manager.self, from: json)
+        XCTAssertEqual(try encoder.encode(decoded), json, "Codable round-trip lost a field")
+
+        let archiver = NSKeyedArchiver(requiringSecureCoding: true)
+        archiver.encode(original, forKey: NSKeyedArchiveRootObjectKey)
+        archiver.finishEncoding()
+        let unarchived = try XCTUnwrap(
+            try NSKeyedUnarchiver(forReadingFrom: archiver.encodedData)
+                .decodeObject(of: SMB2Manager.self, forKey: NSKeyedArchiveRootObjectKey)
+        )
+        XCTAssertEqual(try encoder.encode(unarchived), json, "NSCoding round-trip lost a field")
+
+        let copied = original.copy() as! SMB2Manager
+        XCTAssertEqual(try encoder.encode(copied), json, "copy() lost a field")
+        XCTAssertEqual(original.timeout, 77)
+    }
+
+    func testCodingFidelityPlainUser() throws {
+        try fidelityRoundTrip {
+            SMB2Manager(
+                url: URL(string: "smb://192.168.1.1/share")!,
+                credential: URLCredential(user: "user", password: "password", persistence: .forSession)
+            )
+        }
+    }
+
+    func testCodingFidelityDomainAndWorkstation() throws {
+        try fidelityRoundTrip {
+            SMB2Manager(
+                url: URL(string: "smb://192.168.1.1/share")!,
+                credential: URLCredential(user: "DOM;WS\\alice", password: "secret", persistence: .forSession)
+            )
+        }
+    }
+
+    func testNSCodingMissingTimeoutDefaultsTo60() throws {
+        // An archive stripped of the timeout key used to decode as 0 —
+        // "timeouts disabled" — hanging every subsequent operation.
+        let original = SMB2Manager(url: URL(string: "smb://192.168.1.1/share")!, credential: nil)!
+        let archiver = NSKeyedArchiver(requiringSecureCoding: true)
+        archiver.encode(original, forKey: NSKeyedArchiveRootObjectKey)
+        archiver.finishEncoding()
+        var plist = try PropertyListSerialization.propertyList(
+            from: archiver.encodedData, options: [], format: nil
+        ) as! [String: Any]
+        let objects = plist["$objects"] as! [Any]
+        var root = objects[1] as! [String: Any]
+        root.removeValue(forKey: "timeout")
+        plist["$objects"] = [objects[0], root] + objects[2...]
+        let stripped = try PropertyListSerialization.data(
+            fromPropertyList: plist, format: .binary, options: 0
+        )
+        let decoded = try XCTUnwrap(
+            try NSKeyedUnarchiver(forReadingFrom: stripped)
+                .decodeObject(of: SMB2Manager.self, forKey: NSKeyedArchiveRootObjectKey)
+        )
+        XCTAssertEqual(decoded.timeout, 60)
+    }
+
+    func testTimeoutNegativeNormalizesToDisabled() {
+        let manager = SMB2Manager(url: URL(string: "smb://127.0.0.1")!, credential: nil)!
+        manager.timeout = -5
+        XCTAssertEqual(manager.timeout, 0, "negative timeout means 'disabled', not 'immediate timeout'")
+    }
 }

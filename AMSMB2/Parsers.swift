@@ -109,6 +109,10 @@ extension DecodableResponse {
             decodedLength = Int(SMB2_SRV_COPYCHUNK_RESUME_KEY_SIZE)
         case UInt32(SMB2_FSCTL_SRV_COPYCHUNK), UInt32(SMB2_FSCTL_SRV_COPYCHUNK_WRITE):
             decodedLength = MemoryLayout<smb2_srv_copychunk_reply>.stride
+        case UInt32(SMB2_FSCTL_GET_REPARSE_POINT):
+            // The C side decodes this into a fixed-size struct regardless of
+            // the server's declared output_count.
+            decodedLength = MemoryLayout<smb2_reparse_data_buffer>.stride
         default:
             decodedLength = Int(reply.output_count)
         }

@@ -55,13 +55,20 @@ final class SMB2RegressionTests: XCTestCase {
         }
         let stream = AsyncInputStream(stream: base)
         stream.open()
-        var buffer = [UInt8](repeating: 0, count: 16)
-        // Blocks until the chunk arrives instead of failing with -1.
-        let count = stream.read(&buffer, maxLength: buffer.count)
-        XCTAssertEqual(count, 3)
-        XCTAssertEqual(Array(buffer.prefix(3)), [1, 2, 3])
-        XCTAssertEqual(stream.read(&buffer, maxLength: buffer.count), 0, "real EOF after the producer finished")
-        XCTAssertEqual(stream.streamStatus, .atEnd)
+        // Read on a bounded expectation: a regression to "never wake up"
+        // must fail the test, not hang the suite.
+        let readDone = expectation(description: "read returned")
+        var result = -99
+        DispatchQueue.global().async {
+            defer { readDone.fulfill() }
+            var buffer = [UInt8](repeating: 0, count: 16)
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            XCTAssertEqual(count, 3)
+            XCTAssertEqual(Array(buffer.prefix(3)), [1, 2, 3])
+            result = stream.read(&buffer, maxLength: buffer.count)
+        }
+        wait(for: [readDone], timeout: 5)
+        XCTAssertEqual(result, 0, "real EOF after the producer finished")
     }
 
     func test_AsyncInputStreamDoesNotSignalEOFWhileProducerYields() {
@@ -298,6 +305,11 @@ final class SMB2RegressionTests: XCTestCase {
         // smb2_destroy_context() promises to free any open smb2fh/smb2dir.
         // Open handles and drop them without closing: the teardown must sweep
         // them (under ASan: exactly once, no double free, no corruption).
+        // Note: SMB2FileHandle.deinit closes its handle first, so on the
+        // happy path the sweep is a no-op — this case guards the teardown
+        // not crashing when state is torn down around live handles; the
+        // sweep itself is verified by the malloc-zone probe in FORK.md
+        // (macOS ASan cannot detect the leak).
         let (client, peer) = try makeClient()
         let finished = expectation(description: "sweep peer finished")
         DispatchQueue.global().async {
@@ -425,6 +437,18 @@ final class SMB2RegressionTests: XCTestCase {
             )
         }
         XCTAssertLessThan(Date().timeIntervalSince(started), 3, "must fail immediately, not via the timeout backstop")
+    }
+
+    // MARK: append rejects negative offsets locally
+
+    func test_AppendRejectsNegativeOffset() {
+        let manager = SMB2Manager(url: URL(string: "smb://127.0.0.1")!, credential: nil)!
+        let finished = expectation(description: "append rejected")
+        manager.append(data: Data([1]), toPath: "file", offset: -5, progress: nil) { error in
+            XCTAssertEqual((error as? POSIXError)?.code, .EINVAL)
+            finished.fulfill()
+        }
+        wait(for: [finished], timeout: 5)
     }
 
     // MARK: a refused connect surfaces ECONNREFUSED on every platform

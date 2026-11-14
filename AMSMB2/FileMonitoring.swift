@@ -82,7 +82,8 @@ public struct SMB2FileChangeType: OptionSet, Hashable, Sendable, CustomStringCon
     /// The client is notified if a named stream is modified.
     public static let streamWrite: Self = .init(rawValue: SMB2_CHANGE_NOTIFY_FILE_NOTIFY_CHANGE_STREAM_WRITE)
     
-    /// The client is notified if a directory is added or removed within the watch tree.
+    /// Watch subdirectories recursively (the SMB2 CHANGE_NOTIFY WATCH_TREE
+    /// flag): include changes below the watched directory itself.
     public static let recursive: Self = .init(rawValue: 0x8000_0000)
     
     /// The client is notified if last write time, creation time or size of a file modified.
@@ -121,14 +122,14 @@ public struct SMB2FileChangeAction: RawRepresentable, Hashable, Sendable, Custom
     
     /// The file was renamed, and FileName contains the new name.
     ///
-    /// This notification is only sent when the rename operation changes the directory the file resides in.
+    /// This notification is only sent when the rename operation does not change the directory the file resides in.
     /// The client will also receive a `removed` notification.
     /// This notification will not be received if the file is renamed within a directory.
     public static let added = Self(rawValue: SMB2_NOTIFY_CHANGE_FILE_ACTION_ADDED)
     
     /// The file was renamed, and FileName contains the old name.
     ///
-    /// This notification is only sent when the rename operation changes the directory the file resides in.
+    /// This notification is only sent when the rename operation does not change the directory the file resides in.
     /// The client will also receive a `added` notification.
     /// This notification will not be received if the file is renamed within a directory.
     public static let removed = Self(rawValue: SMB2_NOTIFY_CHANGE_FILE_ACTION_REMOVED)

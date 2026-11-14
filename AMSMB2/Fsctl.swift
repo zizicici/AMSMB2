@@ -157,6 +157,11 @@ extension IOCtl {
             let printLen = try data.scanInt(offset: 14, as: UInt16.self).unwrap()
             let flag = try data.scanValue(offset: 16, as: UInt32.self).unwrap()
 
+            // Names must live inside the declared data (count), not the
+            // padding after it — C's decoder enforces the same.
+            guard substituteOffset + substituteLen <= count,
+                  printOffset + printLen <= count
+            else { throw POSIXError(.invalidArgument, description: nil) }
             let substituteData = data.dropFirst(
                 Int(SymbolicLinkReparse.headerLength + substituteOffset)
             ).prefix(substituteLen)
@@ -243,6 +248,11 @@ extension IOCtl {
             let substituteLen = try data.scanInt(offset: 10, as: UInt16.self).unwrap()
             let printOffset = try data.scanInt(offset: 12, as: UInt16.self).unwrap()
             let printLen = try data.scanInt(offset: 14, as: UInt16.self).unwrap()
+            let count = try data.scanInt(offset: 4, as: UInt16.self).unwrap()
+            // Names must live inside the declared data, not the padding.
+            guard substituteOffset + substituteLen <= count,
+                  printOffset + printLen <= count
+            else { throw POSIXError(.invalidArgument, description: nil) }
 
             let substituteData = data.dropFirst(
                 Int(MountPointReparse.headerLength + substituteOffset)

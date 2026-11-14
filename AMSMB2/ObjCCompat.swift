@@ -86,6 +86,7 @@ extension SMB2Manager {
        - encrypted: Enables SMB3 encryption if `true`, it fails with error in case server does not support encryption.
        - completionHandler: closure will be run after enumerating is completed.
      */
+    @available(swift, obsoleted: 1.0)
     @objc(connectShareWithName:encrypted:completionHandler:)
     public func __connectShare(
         name: String, encrypted: Bool, completionHandler: @Sendable @escaping (_ error: (any Error)?) -> Void
@@ -127,6 +128,7 @@ extension SMB2Manager {
 
      - Important: Disconnecting when an operation is in progress may cause disgraceful termination of operation.
      */
+    @available(swift, obsoleted: 1.0)
     @objc(disconnectShareGracefully:completionHandler:)
     public func __disconnectShare(
         gracefully: Bool, completionHandler: SimpleCompletionHandler
@@ -139,6 +141,7 @@ extension SMB2Manager {
 
      - Parameter completionHandler: closure will be run after echoing server is completed.
      */
+    @available(swift, obsoleted: 1.0)
     @objc(echoWithCompletionHandler:)
     public func __echo(completionHandler: SimpleCompletionHandler) {
         echo(completionHandler: completionHandler)
@@ -364,7 +367,7 @@ extension SMB2Manager {
 
     /**
      Fetches data contents of a file from an offset with specified length. With reporting progress
-     on about every 1MiB.
+     per negotiated I/O chunk (64KiB to 8MiB).
 
      - Note: If offset is bigger than file's size, an empty `NSData` will be returned. If length exceeds file, returned data
          will be truncated to entire file content from given offset.
@@ -409,7 +412,7 @@ extension SMB2Manager {
     
     /**
      Streams data contents of a file from an offset with specified length. With reporting data and progress
-     on about every 1MiB.
+     per negotiated I/O chunk (64KiB to 8MiB).
 
      - Parameters:
        - atPath: path of file to be fetched.
@@ -432,7 +435,7 @@ extension SMB2Manager {
     }
     
     /**
-     Creates/Opens and writes data to file at given offset. With reporting progress on about every 1MiB.
+     Creates/Opens and writes data to file at given offset. With reporting progress per negotiated I/O chunk.
      
      - Important: If file size is greater than offset, contents after offset shall be truncated.
          If file size is less than offset, file size will be increased to the offset first.
@@ -456,9 +459,10 @@ extension SMB2Manager {
     ) {
         append(data: data, toPath: path, offset: offset, progress: progress, completionHandler: completionHandler)
     }
+    // The negative-offset guard lives in the Swift entry point it forwards to.
     
     /**
-     Creates and writes data to file. With reporting progress on about every 1MiB.
+     Creates and writes data to file. With reporting progress per negotiated I/O chunk.
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
 
@@ -480,7 +484,7 @@ extension SMB2Manager {
     }
     
     /**
-     Copy files to a new location. With reporting progress on about every 1MiB.
+     Copy files to a new location. With reporting progress per negotiated I/O chunk.
 
      - Parameters:
        - atPath: path of file to be copied from.
@@ -501,7 +505,7 @@ extension SMB2Manager {
     }
     
     /**
-     Uploads local file contents to a new location. With reporting progress on about every 1MiB.
+     Uploads local file contents to a new location. With reporting progress per negotiated I/O chunk.
 
      - Note: given url must be local file url otherwise it will throw error.
 
@@ -521,7 +525,7 @@ extension SMB2Manager {
     }
     
     /**
-     Downloads file contents to a local url. With reporting progress on about every 1MiB.
+     Downloads file contents to a local url. With reporting progress per negotiated I/O chunk.
 
      - Note: if a file already exists on given url, This function will overwrite to that url.
 

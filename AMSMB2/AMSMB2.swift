@@ -19,6 +19,10 @@ import SystemPackage
 #endif
 
 /// Implements SMB2 File operations.
+///
+/// Completion handlers and progress closures run on an internal concurrent
+/// dispatch queue; dispatch to your own queue (e.g. the main queue) before
+/// touching UI state.
 #if canImport(Darwin)
 @objc(AMSMB2Manager)
 #endif
@@ -78,11 +82,15 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             return state.client?.timeout ?? state.timeout
         }
         set {
+            // Negative values are "disable", same as zero; normalizing here
+            // keeps libsmb2 from stamping PDUs with already-expired
+            // deadlines (its check is "non-zero", not "positive").
+            let normalized = max(0, newValue)
             clientLock.lock()
-            _timeout = newValue
+            _timeout = normalized
             let client = _client
             clientLock.unlock()
-            client?.timeout = newValue
+            client?.timeout = normalized
         }
     }
 
@@ -195,7 +203,13 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         self._user = aDecoder.decodeObject(of: NSString.self, forKey: CodingKeys.user.stringValue) as String? ?? "guest"
         self._password =
             aDecoder.decodeObject(of: NSString.self, forKey: CodingKeys.password.stringValue) as String? ?? ""
-        self._timeout = aDecoder.decodeDouble(forKey: CodingKeys.timeout.stringValue)
+        // decodeDouble returns 0 for a missing key; 0 means "timeouts
+        // disabled" here, so a stripped archive would hang every operation.
+        if aDecoder.containsValue(forKey: CodingKeys.timeout.stringValue) {
+            self._timeout = aDecoder.decodeDouble(forKey: CodingKeys.timeout.stringValue)
+        } else {
+            self._timeout = 60
+        }
         super.init()
     }
 
@@ -470,8 +484,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             let blockSize = UInt64(stat.f_bsize)
             // NSNumber allows to cast to any number type, but it is unsafe to cast to types with lower bitwidth
             result[.systemNumber] = NSNumber(value: stat.f_fsid)
-            // A defective server can report f_bsize == 0; guard the division.
-            if blockSize > 0, stat.f_blocks < UInt64.max / blockSize {
+            // A defective server can report f_bsize == 0 or absurd counts;
+            // guard the divisions and multiplications (overflow would trap).
+            if blockSize > 0,
+                stat.f_blocks < UInt64.max / blockSize,
+                stat.f_bavail < UInt64.max / blockSize
+            {
                 result[.systemSize] = NSNumber(value: blockSize * stat.f_blocks)
                 result[.systemFreeSize] = NSNumber(value: blockSize * stat.f_bavail)
             }
@@ -899,7 +917,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     /**
      Fetches data contents of a file from an offset with specified length. With reporting progress
-     on about every 1MiB.
+     per negotiated I/O chunk (64KiB to 8MiB).
 
      - Note: If range's lowerBound is bigger than file's size, an empty `Data` will be returned.
              If range's length exceeds file, returned data will be truncated to entire file content from given offset.
@@ -935,7 +953,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     /**
      Fetches data contents of a file from an offset with specified length. With reporting progress
-     on about every 1MiB.
+     per negotiated I/O chunk (64KiB to 8MiB).
 
      - Note: If range's lowerBound is bigger than file's size, an empty `Data` will be returned.
              If range's length exceeds file, returned data will be truncated to entire file content from given offset.
@@ -963,7 +981,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
     /**
      Streams data contents of a file from an offset with specified length. With reporting data and progress
-     on about every 1MiB.
+     per negotiated I/O chunk (64KiB to 8MiB).
 
      - Parameters:
        - atPath: path of file to be fetched.
@@ -982,7 +1000,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     ) {
         with(completionHandler: completionHandler) { client in
             let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
-            let size = try Int64(file.fstat().smb2_size)
+            let size = Int64(clamping: try file.fstat().smb2_size)
 
             var shouldContinue = true
             try file.seek(offset: offset, from: .start)
@@ -1013,7 +1031,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     
     /**
      Fetches data contents of a file from an offset with specified length. With reporting progress
-     on about every 1MiB.
+     per negotiated I/O chunk (64KiB to 8MiB).
 
      - Note: If range's lowerBound is bigger than file's size, an empty `Data` will be returned.
              If range's length exceeds file, returned data will be truncated to entire file content from given offset.
@@ -1068,7 +1086,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
     
     /**
-     Creates and writes data to file. With reporting progress on about every 1MiB.
+     Creates and writes data to file. With reporting progress per negotiated I/O chunk.
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
 
@@ -1094,7 +1112,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Creates and writes data to file. With reporting progress on about every 1MiB.
+     Creates and writes data to file. With reporting progress per negotiated I/O chunk.
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
 
@@ -1118,7 +1136,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
     
     /**
-     Creates/Opens and writes data to file at given offset. With reporting progress on about every 1MiB.
+     Appends data to an existing file at the given offset (the file is not created; use write(data:) for that). With reporting progress per negotiated I/O chunk.
      
      - Important: If file size is greater than offset, contents after offset shall be truncated.
          If file size is less than offset, file size will be increased to the offset first.
@@ -1138,6 +1156,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         data: DataType, toPath path: String, offset: Int64, progress: WriteProgressHandler,
         completionHandler: SimpleCompletionHandler
     ) {
+        guard offset >= 0 else {
+            completionHandler?(POSIXError(.invalidArgument, description: "Offset must not be negative."))
+            return
+        }
         let data = Data(data)
         with(completionHandler: completionHandler) { client in
             try self.write(
@@ -1148,7 +1170,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Creates/Opens and writes data to file at given offset. With reporting progress on about every 1MiB.
+     Appends data to an existing file at the given offset (the file is not created; use write(data:) for that). With reporting progress per negotiated I/O chunk.
      
      - Important: If file size is greater than offset, contents after offset shall be truncated.
          If file size is less than offset, file size will be increased to the offset first.
@@ -1176,7 +1198,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Creates and writes input stream to file. With reporting progress on about every 1MiB.
+     Creates and writes input stream to file. With reporting progress per negotiated I/O chunk.
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
 
@@ -1185,7 +1207,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      - Parameters:
        - stream: input stream that provides data to be written to file.
        - toPath: path of file to be written.
-       - chunkSize: optimized chunk size to read from stream. Default value is about 1MB.
+       - chunkSize: chunk size to read from the stream. The default (0) picks the connection's negotiated optimal size.
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort writing.
        - bytes: written bytes count.
@@ -1205,7 +1227,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Creates and writes input stream to file. With reporting progress on about every 1MiB.
+     Creates and writes input stream to file. With reporting progress per negotiated I/O chunk.
 
      - Note: Data saved in server maybe truncated when completion handler returns error.
 
@@ -1214,7 +1236,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      - Parameters:
        - stream: input stream that provides data to be written to file.
        - toPath: path of file to be written.
-       - chunkSize: optimized chunk size to read from stream. Default value is about 1MB.
+       - chunkSize: chunk size to read from the stream. The default (0) picks the connection's negotiated optimal size.
        - progress: reports progress of written bytes count so far.
            User must return `true` if they want to continuing or `false` to abort writing.
        - bytes: written bytes count.
@@ -1231,7 +1253,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Copy file contents to a new location. With reporting progress on about every 1MiB.
+     Copy file contents to a new location. With reporting progress per negotiated I/O chunk.
 
      - Note: This operation consists downloading and uploading file.
 
@@ -1262,7 +1284,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Copy files to a new location. With reporting progress on about every 1MiB.
+     Copy files to a new location. With reporting progress per negotiated I/O chunk.
 
      - Parameters:
        - atPath: path of file to be copied from.
@@ -1287,7 +1309,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Copy files to a new location. With reporting progress on about every 1MiB.
+     Copy files to a new location. With reporting progress per negotiated I/O chunk.
 
      - Parameters:
        - atPath: path of file to be copied from.
@@ -1309,7 +1331,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Uploads local file contents to a new location. With reporting progress on about every 1MiB.
+     Uploads local file contents to a new location. With reporting progress per negotiated I/O chunk.
 
      - Note: given url must be local file url otherwise it will throw error.
 
@@ -1331,7 +1353,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Uploads local file contents to a location, optionally replacing an existing file. With reporting progress on about every 1MiB.
+     Uploads local file contents to a location, optionally replacing an existing file. With reporting progress per negotiated I/O chunk.
 
      - Note: given url must be local file url otherwise it will throw error.
 
@@ -1363,7 +1385,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Uploads local file contents to a new location. With reporting progress on about every 1MiB.
+     Uploads local file contents to a new location. With reporting progress per negotiated I/O chunk.
 
      - Note: given url must be local file url otherwise it will throw error.
 
@@ -1385,7 +1407,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Uploads local file contents to a location, optionally replacing an existing file. With reporting progress on about every 1MiB.
+     Uploads local file contents to a location, optionally replacing an existing file. With reporting progress per negotiated I/O chunk.
 
      - Note: given url must be local file url otherwise it will throw error.
 
@@ -1408,7 +1430,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Downloads file contents to a local url. With reporting progress on about every 1MiB.
+     Downloads file contents to a local url. With reporting progress per negotiated I/O chunk.
 
      - Note: if a file already exists on given url, This function will overwrite to that url.
 
@@ -1438,7 +1460,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     /**
-     Downloads file contents to a local url. With reporting progress on about every 1MiB.
+     Downloads file contents to a local url. With reporting progress per negotiated I/O chunk.
 
      - Note: if a file already exists on given url, This function will overwrite to that url.
 
@@ -1690,7 +1712,7 @@ extension SMB2Manager {
         client: SMB2Client, fromPath path: String, toPath: String, progress: CopyProgressHandler
     ) throws -> Int64? {
         let fileSource = try SMB2FileHandle(forReadingAtPath: path, on: client)
-        let size = try Int64(fileSource.fstat().smb2_size)
+        let size = Int64(clamping: try fileSource.fstat().smb2_size)
         let sourceKey = try fileSource.requestResumeKey()
         // MS-SMB2 caps a single SRV_COPYCHUNK at 1 MiB regardless of the
         // negotiated write size.
@@ -1724,7 +1746,7 @@ extension SMB2Manager {
         client: SMB2Client, fromPath path: String, toPath: String, progress: CopyProgressHandler
     ) throws -> Int64? {
         let fileRead = try SMB2FileHandle(forReadingAtPath: path, on: client)
-        let size = try Int64(fileRead.fstat().smb2_size)
+        let size = Int64(clamping: try fileRead.fstat().smb2_size)
         let fileWrite = try SMB2FileHandle(forCreatingIfNotExistsAtPath: toPath, on: client)
         var shouldContinue = true
         var written = 0
@@ -1769,7 +1791,9 @@ extension SMB2Manager {
         to stream: OutputStream, progress: ReadProgressHandler
     ) throws {
         let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
-        let filesize = try Int64(file.fstat().smb2_size)
+        let filesize = Int64(clamping: try file.fstat().smb2_size)
+        // Both operands are non-negative here (int64Range clamps negative
+        // lower bounds to 0), so the subtraction cannot overflow.
         let length = range.upperBound - range.lowerBound
         let size = min(length, filesize - range.lowerBound)
 

@@ -161,9 +161,14 @@ final class SMB2LifetimeTests: XCTestCase {
 
     /// stat/rename/truncate/readlink are all CREATE-led compounds sharing one
     /// C-side callback state between their members. A half-received CREATE
-    /// reply leaves the later members queued; the PDU timeout fires them while
-    /// the CREATE reply is still in flight, so the shared state must survive
-    /// every firing order and complete the user callback exactly once.
+    /// reply leaves the later members queued.
+    ///
+    /// Completion mechanism (measured): the user-visible ETIMEDOUT comes from
+    /// the Swift `timeout + 2` backstop, which tears the context down; the
+    /// C-side member accounting (pending refcounting, SHUTDOWN fan-out) runs
+    /// during that teardown — so these cases lock the teardown path end to
+    /// end, with the ASan run as the memory-safety gate. A pure C-side
+    /// timeout completion (without the backstop) is not exercised here.
     private func checkCompoundPartialReplyTimeout(
         description: String,
         command: smb2_command,

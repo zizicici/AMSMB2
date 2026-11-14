@@ -1,7 +1,7 @@
 # AMSMB2
 
 
-This is small Swift library for iOS, macOS and tvOS which wraps [libsmb2 fork](https://github.com/zizicici/libsmb2) (based on [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2)) and allows to connect a SMB2/3 share and do file operation.
+This is small Swift library for iOS, macOS, tvOS, watchOS, visionOS (and Linux) which wraps [libsmb2 fork](https://github.com/zizicici/libsmb2) (based on [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2)) and allows to connect a SMB2/3 share and do file operation.
 
 [![Swift Version Compatibility][swift-version-image]][swift-version-url]
 [![Platform Compatibility ][platform-image]][platform-url]
