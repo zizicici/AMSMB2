@@ -105,7 +105,9 @@ final class SMB2FileHandle: @unchecked Sendable {
     ) throws {
         var leaseData = opLock.leaseContext.map { Data($0.regions.joined()) } ?? .init()
         defer { withExtendedLifetime(leaseData) {} }
-        let (_, result) = try path.replacingOccurrences(of: "/", with: "\\").withCString { path in
+        // Trim before the separator swap: a leading "/" used to become a
+        // leading "\", which Samba's CREATE rejects with INVALID_PARAMETER.
+        let (_, result) = try path.trimmedPath.replacingOccurrences(of: "/", with: "\\").withCString { path in
             try client.async_await_pdu(dataHandler: SMB2FileID.init) {
                 context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
                 var req = smb2_create_request()
@@ -209,6 +211,10 @@ final class SMB2FileHandle: @unchecked Sendable {
     }
     
     func setInfo<T>(_ value: T, type: InfoType = .file, infoClass: InfoClass) throws {
+        // Fail fast like every other method: after close, fileId resolves to
+        // the all-F compound placeholder and this used to still send a
+        // SET_INFO round trip the server could only reject.
+        _ = try handle.unwrap()
         try client.async_await_pdu(dataHandler: EmptyReply.init) {
             context, cbPtr -> UnsafeMutablePointer<smb2_pdu>? in
             var value = value

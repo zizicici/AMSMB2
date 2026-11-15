@@ -1716,6 +1716,33 @@ extension SMB2Manager {
 }
 
 extension SMB2Manager {
+    /// Budget for one recursive listing. The walk depth is driven entirely
+    /// by the server's replies; without a bound a hostile server can keep
+    /// producing "directory" entries forever (the self-referential form
+    /// keeps the path constant, so a path cap alone never trips) or fan out
+    /// wide and exhaust memory. The path cap sits above what real servers
+    /// accept (~4 KiB, so honest trees never trip it) and also keeps the
+    /// client clear of the 16-bit CREATE NameLength wrap the C layer now
+    /// rejects; the entry cap matches the cost of listing a legitimately
+    /// enormous share.
+    static let recursiveListingMaxEntries = 1_000_000
+    static let recursiveListingMaxPathUTF16Count = 8_192
+
+    static func checkRecursiveListingBudget(entries: Int, pathUTF16Count: Int) throws {
+        if entries > recursiveListingMaxEntries {
+            throw POSIXError(
+                .fileTooLarge,
+                description: "Recursive listing exceeded \(recursiveListingMaxEntries) entries; the server may be hostile."
+            )
+        }
+        if pathUTF16Count > recursiveListingMaxPathUTF16Count {
+            throw POSIXError(
+                .invalidArgument,
+                description: "A path grew past \(recursiveListingMaxPathUTF16Count) UTF-16 characters during recursive listing."
+            )
+        }
+    }
+
     private func listDirectory(client: SMB2Client, path: String, recursive: Bool) throws
         -> [[URLResourceKey: any Sendable]]
     {
@@ -1728,6 +1755,11 @@ extension SMB2Manager {
         // next sibling.
         var pending: [String] = [path]
         while let current = pending.popLast() {
+            if recursive {
+                try SMB2Manager.checkRecursiveListingBudget(
+                    entries: contents.count, pathUTF16Count: current.utf16.count
+                )
+            }
             let dir = try SMB2Directory(current.trimmedPath, on: client)
             var subDirectories = [String]()
             for ent in dir {

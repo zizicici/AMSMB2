@@ -1,7 +1,7 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-12`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
+(tag `amsmb2-fork-13`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
 The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
 the regression suites assume them.
 
@@ -100,6 +100,20 @@ the regression suites assume them.
   blocks, and blocking made the urandom fallback unreachable); a
   zero-return guard stops a broken wrapper from spinning. The BSDs
   (OpenBSD/FreeBSD/NetBSD/DragonFly) join Darwin on arc4random_buf.
+- fork-13 — `smb2_encode_create_request()` rejects names whose UTF-16
+  form exceeds the 16-bit NameLength field: at exactly 32,768 characters
+  the wrapped length is zero and the client silently opened the share
+  root instead of the requested path (verified end-to-end against a
+  real server; a hostile server could drive a recursive listing into
+  the wrap window and have it enumerate — or delete — the wrong
+  subtree). The server-side query-directory reply encoder had the same
+  signed/unsigned stride comparison class plus an unconditional first
+  iteration (heap over-read on short buffers, ASan-reproduced; only
+  reachable through the fork's own server APIs, never the client), and
+  two `output_buffer_length < 0` checks on an unsigned field were dead
+  (now test the `(uint32_t)-1` sentinel they were aimed at). A
+  malformed directory reply reports EIO instead of a misleading
+  ENOMEM.
 
 ## Syncing with upstream
 
@@ -144,8 +158,11 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 ### Known weak locks
 
 - The compound-timeout cases pass even with `smb2_timeout_pdus()` stubbed
-  out: AMSMB2's `timeout + 2` Swift backstop produces the same ETIMEDOUT.
-  They guard against the use-after-free under ASan, not the C fan-out.
+  out: AMSMB2's `timeout + 2` Swift backstop produces the same ETIMEDOUT
+  (fifth re-check, round 12). They guard against the use-after-free under
+  ASan — reverting the pending-refcount fix crashes under ASan — and
+  `SMB2FileStatTests/testFstatTagTimeoutFailsFast` does kill the fan-out
+  stub, so the C fan-out itself is no longer lock-free.
 - `test_DestroyContextSweepsUnclosedHandles` passes with the sweep loop
   removed (macOS has no LeakSanitizer); the sweep itself was verified
   once with the malloc-zone probe described above.
@@ -195,6 +212,34 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
 - The BSD `arc4random_buf` branch assumes FreeBSD ≥ 12 (older libc
   lacks the symbol and would fail to link). Swift toolchains for
   FreeBSD target 13/14; no supported configuration is affected.
+- The recursive listing walk is bounded by two budgets
+  (`recursiveListingMaxEntries` = 1,000,000 entries and
+  `recursiveListingMaxPathUTF16Count` = 8,192 UTF-16 units) so a hostile
+  server cannot walk forever or exhaust memory with fabricated directory
+  entries (the self-referential form keeps the path constant, so a path
+  cap alone never trips; the wide form grows ~2 GiB/s unbounded). The
+  budget helper is unit-tested; the walk's invocation of it has no
+  automated lock (a lying server would be required — an honest server
+  cannot exceed the caps). The same trust domain applies to a single
+  opendir that never ends: pages accumulate in the C layer until the
+  per-operation timeout, several GB on a fast link.
+- The full-parameter `SMB2FileHandle(path:…)` init trims before the
+  separator swap; a leading "/" used to become a leading "\" that
+  Samba's CREATE rejects (round-12 audit, harness-verified). No
+  automated lock: on the current test container the pre-fix error did
+  not reproduce a distinguishable signature.
+- `nterror_to_errno(STATUS_LOGON_FAILURE)` maps to ECONNREFUSED
+  (upstream): an authentication failure is misreported as a connection
+  refusal and misleads troubleshooting.
+- `seek(.end)` uses the file size snapshotted at open (upstream); writes
+  through the same handle do not update it. No in-repo caller uses
+  `.end`.
+- Paths are share-root-relative when they do not start with "/" and the
+  empty path means the share root for reads but fails differently
+  (EPERM/EEXIST/EACCES) per API — neither is documented in the API doc
+  comments.
+- A change-notify reply with an empty output buffer (MS-SMB2's "re-
+  enumerate the directory" signal) is swallowed as an empty change list.
 - Once observed (round 10; not reproduced since — four fresh Samba
   4.23.8 containers, two full suites and 60 targeted runs all pass): a
   CLOSE carrying SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB after DELETE_ON_CLOSE

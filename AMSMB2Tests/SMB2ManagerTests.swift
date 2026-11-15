@@ -742,6 +742,76 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         try await smb.removeDirectory(atPath: root, recursive: true)
     }
 
+    func testRecursiveListingOrderMatchesReferencePreOrder() async throws {
+        // Locks the "iterative DFS preserves the recursive pre-order exactly"
+        // promise: a directory's entries, then each subtree fully before the
+        // next sibling. Reference implemented with the old shape (per-level
+        // non-recursive enumeration + recursion in listing order).
+        let smb = SMB2Manager(url: server, credential: credential)!
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        defer { addTeardownBlock { try? await smb.removeDirectory(atPath: "ord-lock", recursive: true) } }
+
+        try? await smb.removeDirectory(atPath: "ord-lock", recursive: true)
+        try await smb.createDirectory(atPath: "ord-lock")
+
+        // Mirrors the old recursive shape: list one level (pathKey carries
+        // the library's own formatting — trailing slash on directories),
+        // then recurse into each subdirectory in listing order.
+        func referenceList(_ path: String) async throws -> [String] {
+            let entries = try await smb.contentsOfDirectory(atPath: path, recursive: false)
+            var out = entries.compactMap { $0[.pathKey] as? String }
+            for entry in entries where (entry[.isDirectoryKey] as? Bool) == true {
+                if let subPath = entry[.pathKey] as? String {
+                    out.append(contentsOf: try await referenceList(subPath))
+                }
+            }
+            return out
+        }
+
+        for tree in 0..<6 {
+            let root = tree == 0 ? "ord-lock/chain" : "ord-lock/t\(tree)"
+            try await smb.createDirectory(atPath: root)
+            // chain of 8
+            var current = root
+            for _ in 0..<8 { current += "/d"; try await smb.createDirectory(atPath: current) }
+            // wide fan of 5 under root with one file each
+            for i in 0..<5 {
+                try await smb.write(data: Data([UInt8(i)]), toPath: "\(root)/f\(i)", progress: nil)
+            }
+            // one nested wide level under the first dir
+            try await smb.createDirectory(atPath: "\(root)/d/sub")
+            for i in 0..<3 { try await smb.write(data: Data([UInt8(i)]), toPath: "\(root)/d/sub/g\(i)", progress: nil) }
+
+            let produced = try await smb.contentsOfDirectory(atPath: root, recursive: true)
+                .compactMap { $0[.pathKey] as? String }
+            let reference = try await referenceList(root)
+            XCTAssertEqual(produced, reference, "tree \(root): iterative DFS must equal the recursive pre-order")
+        }
+    }
+
+    func testCreateSymlinkAbsolutePathReachesReparseStage() async throws {
+        // The full-parameter open used to skip trimming, so an absolute path
+        // went on the wire as "\dir\link" and Samba's CREATE rejected it
+        // with STATUS_INVALID_PARAMETER before the reparse step was ever
+        // reached. After the fix the failure (on servers without reparse
+        // support) must be the FSCTL one, not the CREATE one.
+        let smb = SMB2Manager(url: server, credential: credential)!
+        let link = "/\(fileName(postfix: "Abs"))"
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        do {
+            try await smb.createSymbolicLink(atPath: link, withDestinationPath: "target")
+            try? await smb.removeFile(atPath: link)
+            throw XCTSkip("Server supports reparse points; the CREATE-stage failure path is not reachable here.")
+        } catch let skip as XCTSkip { throw skip }
+        catch {
+            let description = (error as? LocalizedError)?.errorDescription ?? ""
+            XCTAssertFalse(
+                description.contains("0xC000000D"),
+                "absolute path must not fail CREATE with STATUS_INVALID_PARAMETER; got: \(description)"
+            )
+        }
+    }
+
     func testRemove() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
 

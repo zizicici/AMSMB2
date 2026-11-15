@@ -571,6 +571,25 @@ final class SMB2RegressionTests: XCTestCase {
         }
     }
 
+    // MARK: the recursive-listing budget bounds hostile walks
+
+    func test_RecursiveListingBudget() throws {
+        // The walk is server-driven; a hostile server can produce directory
+        // entries forever (the self-referential form keeps the path constant,
+        // so only the entry cap stops it) or grow paths past the 16-bit
+        // CREATE NameLength wrap. Both caps must trip fail-closed.
+        let maxEntries = SMB2Manager.recursiveListingMaxEntries
+        let maxPath = SMB2Manager.recursiveListingMaxPathUTF16Count
+
+        XCTAssertNoThrow(try SMB2Manager.checkRecursiveListingBudget(entries: maxEntries, pathUTF16Count: maxPath))
+        XCTAssertThrowsError(try SMB2Manager.checkRecursiveListingBudget(entries: maxEntries + 1, pathUTF16Count: 1)) {
+            XCTAssertEqual(($0 as? POSIXError)?.code, .EFBIG)
+        }
+        XCTAssertThrowsError(try SMB2Manager.checkRecursiveListingBudget(entries: 1, pathUTF16Count: maxPath + 1)) {
+            XCTAssertEqual(($0 as? POSIXError)?.code, .EINVAL)
+        }
+    }
+
     // MARK: validation failures still deliver completions asynchronously
 
     func test_ValidationErrorsDeliverCompletionAsynchronously() {
