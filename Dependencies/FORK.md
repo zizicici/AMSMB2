@@ -1,10 +1,12 @@
 # libsmb2 fork
 
-`Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(current: `amsmb2-fork-13`, kept in sync with the fork's `master`), not
-upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2). The fork
-carries fixes that AMSMB2's teardown, timeout and hostile-input handling
-depend on; the regression suites assume them.
+`Dependencies/libsmb2` tracks the `master` branch of
+[zizicici/libsmb2](https://github.com/zizicici/libsmb2) (see `branch` in
+`.gitmodules`; `git submodule update --remote` follows it), not upstream
+[sahlberg/libsmb2](https://github.com/sahlberg/libsmb2). `amsmb2-fork-N`
+tags mark reviewed pins — currently `amsmb2-fork-13` — and master moves
+only through them. The fork carries fixes that AMSMB2's teardown, timeout
+and hostile-input handling depend on; the regression suites assume them.
 
 ## Divergence from upstream (base a52c157)
 
