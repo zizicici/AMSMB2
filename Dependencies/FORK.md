@@ -1,258 +1,176 @@
 # libsmb2 fork
 
 `Dependencies/libsmb2` pins [zizicici/libsmb2](https://github.com/zizicici/libsmb2)
-(tag `amsmb2-fork-13`), not upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2).
-The fork carries fixes that AMSMB2's teardown and timeout handling depend on;
-the regression suites assume them.
+(current: `amsmb2-fork-13`, kept in sync with the fork's `master`), not
+upstream [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2). The fork
+carries fixes that AMSMB2's teardown, timeout and hostile-input handling
+depend on; the regression suites assume them.
 
 ## Divergence from upstream (base a52c157)
 
-- `933b2a4` — Compound callback state (`stat`/`statvfs`/`fstat`, `truncate`,
-  `rename`/`link`, `symlink`, `readlink`, `mkdir`/`rmdir`/`unlink` families)
-  is reference-counted: every member callback drops a `pending` reference on
-  every exit path, so any firing order (reply order, PDU timeout, context
-  teardown) completes the user callback exactly once.
-  `smb2_timeout_pdus()` fires every member of an unsent compound chain
-  instead of just the head.
+Compound callback lifetime (use-after-free fixes, ASan-guarded):
+
+- `933b2a4` — compound callback state is reference-counted; every member
+  callback drops a `pending` reference on every exit path, so any firing
+  order completes the user callback exactly once. `smb2_timeout_pdus()`
+  fires every member of an unsent chain, not just the head.
 - `5789b33` — `smb2_queue_pdu()` fires all chain members before freeing on
-  an encryption abort (same invariant at queue time); three allocation-
-  failure paths free their callback state.
-- `c3ea44c` — A refused non-blocking connect on macOS (POLLHUP-only)
-  completes the pending connect callback with the real `SO_ERROR` errno;
-  `nterror_to_errno(SMB2_STATUS_SHUTDOWN)` maps to EIO instead of a bogus
-  EPERM; the notify chain is freed iteratively; encryption aborts no longer
-  double-free `caller_frees_pdu` PDUs.
-- `fd9b7dd` — `smb2_destroy_context()` sweeps open `smb2fh`/`smb2dir` on
-  per-context lists, restoring its documented contract (verified with a
-  malloc-zone probe: 100 unclosed handles, 98 blocks leaked before, none
-  after).
+  an encryption abort; allocation-failure paths free their callback state.
+- `fd9b7dd` — `smb2_destroy_context()` sweeps open `smb2fh`/`smb2dir` from
+  per-context lists, restoring its documented contract.
 - `4086bb7` — the fstat compound applies the final attribute-tag at
-  completion, so a reordered (info-first) reply still yields the right
-  file type. This is what lets AMSMB2 call `smb2_fstat_async()` directly
-  instead of hand-rolling two sequential queries.
-- `cfa6e9d` — POLLHUP no longer discards replies already sitting in the
-  socket buffer (the peer answering and hanging up in one burst reported
-  the operation as failed); the connect-stage POLLHUP completion tries
-  the next resolved address like POLLERR/POLLOUT; the compound writev
-  aggregation caps its iovec count; and all allocation-failure paths of
-  the stat/truncate/rename compounds complete the caller with -ENOMEM.
-- `6c5987e`/`7c0bfcd` (revising the unbounded first cut `6576648`) —
-  commands synchronously queued from inside an
-  encryption-abort callback are parked and completed iteratively (a
-  bounded budget stops a pathological re-queueing callback; the parked
-  error string is no longer overwritten), and the POLLHUP input drain is
-  skipped while still connecting.
-- `59d67cd` — the parking list honors the documented cancel-by-free
-  contract (`smb2_free_pdu` unlinks parked chains; the sync wrappers'
-  pending check covers them; teardown drains them inside the main queue
-  loop), and directory replies whose NextEntryOffset steps overlap
-  entries (min 80-byte fixed part enforced) can no longer amplify one
-  heap allocation per few wire bytes.
+  completion, so reordered replies still yield the right file type.
+- `6c5987e`/`7c0bfcd` (revising `6576648`) — commands re-queued from inside
+  an encryption-abort callback are parked and completed iteratively with a
+  bounded budget (exhausted chains are dropped without firing; the earlier
+  fire-before-free variant recursed without bound).
+- `59d67cd` — the parking list honors the cancel-by-free contract;
+  directory replies with overlapping NextEntryOffset chains can no longer
+  amplify one heap allocation per few wire bytes (min 80-byte step).
+
+Connection and socket handling:
+
+- `c3ea44c` — a refused non-blocking connect on macOS (POLLHUP-only)
+  completes with the real `SO_ERROR`; SHUTDOWN maps to EIO instead of EPERM;
+  notify chains free iteratively; no `caller_frees_pdu` double-free.
+- `cfa6e9d` — POLLHUP no longer discards replies already in the socket
+  buffer; connect-stage POLLHUP tries the next resolved address; compound
+  writev caps its iovec count; allocation failures complete the caller.
+
+Hostile-input hardening:
+
+- `e49ce3b` — forged Write replies claiming more bytes than sent are
+  rejected; negotiated MaxRead/MaxWriteSize clamp to 8 MiB; NULL context
+  tolerated in `smb2_fh_from_file_id()`; notify errors convert NT statuses.
+- `94b02ad` — the Write reply clamp compares against the on-wire amount,
+  not the original request.
+- `8262429` — read/write count clamps are skipped when the negotiated size
+  is zero; clamping to zero wrapped the unsigned `(count - 1)` credit
+  computation into a multi-gigabyte request length.
+- `bc5d2dd` — the credit balance is capped at `MAX_CREDITS`, never sent on
+  when negative, and no longer multiplied into the request length when
+  non-positive (a negative balance previously produced ~4 GiB requests:
+  out-of-bounds write on read, memory disclosure on write).
+- `fee8b0e` — the pwrite reply ceiling applies the encoder's
+  non-multi-credit 64 KiB clamp (residual forged-reply window of
+  `94b02ad`); `getrandom()` uses `GRND_NONBLOCK` so an unseeded CRNG at
+  early boot falls through to `/dev/urandom` instead of hanging.
+- `c2ca057` — `smb2_encode_create_request()` rejects names whose UTF-16
+  form exceeds the 16-bit NameLength field (at 32,768 characters the
+  wrapped length is zero and the request silently opened the share root);
+  the server-side query-directory reply encoder checks its signed stride
+  before the first iteration (was an unconditional do-while with a
+  signed/unsigned comparison — heap over-read); two dead
+  `output_buffer_length < 0` checks now test `(uint32_t)-1`; malformed
+  directory replies report EIO instead of ENOMEM.
+
+CSPRNG and platform config (`include/apple/config.h`, first include of
+every translation unit — only compiler-predefined macros can be tested
+here, and `<features.h>` must not be pulled in before the sources define
+`_GNU_SOURCE`):
+
+- `2078fae` — `HAVE_ARC4RANDOM_BUF` on Darwin (its glibc half never took
+  effect; see `bc5d2dd`).
+- `bc5d2dd` — Linux selects `getrandom` + `/dev/urandom` by predefined
+  macros (`__linux__`); Android (bionic) uses `/dev/urandom` only.
+- `fee8b0e` — the BSDs (OpenBSD/FreeBSD/NetBSD/DragonFly) join Darwin on
+  `arc4random_buf` (FreeBSD ≥ 12).
+
+Misc:
+
 - merge of upstream `177a9de` — pre-1970 FILETIMEs decode to negative
-  seconds, matching what the Swift decode layer already assumed.
-- `e49ce3b` — a forged Write reply claiming more bytes than were sent is
-  rejected (the count drove the file offset and caller progress);
-  negotiated MaxRead/MaxWriteSize clamp to 8 MiB (forged values became
-  caller-side buffer sizes); smb2_fh_from_file_id() tolerates a NULL
-  context again; notify errors convert NT statuses through errno (teardown
-  reported EIO, not a bogus EPERM).
-- `94b02ad` — the Write count clamp compares against the on-wire amount
-  (the count after credit/size reduction), not the original request, so a
-  forged reply claiming bytes in that window can no longer silently skip
-  data in sequential writes. Budget-exhausted chains are dropped **without**
-  firing their callbacks: the earlier fire-before-free variant recursed
-  without bound on retry-style callbacks (ASan measured a 27k-frame stack
-  overflow); the bounded callback loss is the documented trade-off.
-- `2078fae` — `HAVE_ARC4RANDOM_BUF` is defined in the Apple config, so on
-  Darwin `smb2_random_bytes()` stops falling back to `random()` seeded
-  with ~32 bits of guessable material for the NTLMv2 client challenge,
-  SMB 3.1.1 preauth salt, client GUID and per-PDU nonces. Its glibc half
-  never took effect (see `bc5d2dd`).
-- `8262429` — the read/write count clamp is skipped when the negotiated
-  size is zero ("not negotiated"): clamping to zero made the unsigned
-  `(count - 1)` credit computation wrap, and an observed 64-byte write
-  went on the wire as a 64 KiB payload read past the caller's buffer (the
-  read path wrote past it). Reachable via a hostile server negotiating
-  MaxRead/MaxWriteSize = 0.
-- `bc5d2dd` — the credit balance (an `int`) is capped at `MAX_CREDITS`
-  when grants arrive, never sent on when negative, and no longer
-  multiplied into the request length when non-positive. A server
-  granting 65535 per reply walked it negative in ~32k replies;
-  `count = credits * 65536` then produced a ~4 GiB read/write length
-  that the server could answer into the caller's small buffer
-  (out-of-bounds write, ASan-verified) or that shipped the caller's
-  memory. A zero balance used to queue a zero-length read that looked
-  like EOF once sent; it now asks for one credit's worth. The Linux
-  CSPRNG is selected by compiler-predefined macros (`getrandom` +
-  `/dev/urandom`): the `__GLIBC__` test `2078fae` used is always false
-  because this config is the first include of every translation unit,
-  and including `<features.h>` here would freeze the feature-test macros
-  before the sources define `_GNU_SOURCE`. Also corrects a QUERY_INFO
-  constant used in the query-directory bounds check (same value today).
-- `fee8b0e` — the pwrite-side reply ceiling now applies the encoder's
-  non-multi-credit 64 KiB clamp: without it a dialect-3.x connection
-  without multi-credit kept the ceiling at the full request while the
-  encoder truncated the payload, and a forged reply claiming the
-  difference silently skipped bytes in sequential writes (the residual
-  window of the `94b02ad` clamp; root cause is upstream's double clamp).
-  getrandom() now uses GRND_NONBLOCK so an unseeded CRNG at early boot
-  falls through to /dev/urandom instead of hanging the client (flags=0
-  blocks, and blocking made the urandom fallback unreachable); a
-  zero-return guard stops a broken wrapper from spinning. The BSDs
-  (OpenBSD/FreeBSD/NetBSD/DragonFly) join Darwin on arc4random_buf.
-- fork-13 — `smb2_encode_create_request()` rejects names whose UTF-16
-  form exceeds the 16-bit NameLength field: at exactly 32,768 characters
-  the wrapped length is zero and the client silently opened the share
-  root instead of the requested path (verified end-to-end against a
-  real server; a hostile server could drive a recursive listing into
-  the wrap window and have it enumerate — or delete — the wrong
-  subtree). The server-side query-directory reply encoder had the same
-  signed/unsigned stride comparison class plus an unconditional first
-  iteration (heap over-read on short buffers, ASan-reproduced; only
-  reachable through the fork's own server APIs, never the client), and
-  two `output_buffer_length < 0` checks on an unsigned field were dead
-  (now test the `(uint32_t)-1` sentinel they were aimed at). A
-  malformed directory reply reports EIO instead of a misleading
-  ENOMEM.
+  seconds.
+- `bc5d2dd` — query-directory bounds check uses the correct
+  `SMB2_QUERY_DIRECTORY_REPLY_SIZE` constant (same value as the
+  QUERY_INFO one it used by mistake).
 
 ## Syncing with upstream
 
-Rebase/merge `upstream` (sahlberg/libsmb2) into the fork's `master`, then
-re-run the guard these patches exist for, in this repository:
-
-    make asan-test
-
-The compound-timeout regressions only abort under AddressSanitizer. After
-syncing, tag the new commit, update the pin above and the submodule pointer.
+Merge `upstream` (sahlberg/libsmb2) into the fork's `master`, re-run the
+guard in this repository (`make asan-test` — the compound-lifetime
+regressions only abort under AddressSanitizer), then tag the new commit
+and update the pin above and the submodule pointer. Upstream's
+`libsmb2-6-branch` maintenance line carries client fixes that master
+absorbs with different patch-ids: compare by content, not patch-id, and
+if upstream ever merges our PR branches, prefer the fork's
+implementations (they carry the regression tests here).
 
 ## Regression coverage in this repository
 
-- Compound timeout firing order:
-  `SMB2LifetimeTests/test{Stat,Rename,Truncate,Readlink}CompoundPartialReplyTimeoutAbortsAllMembersCleanly`
-  (ASan-only — they reproduce the original heap-use-after-free on the
-  pre-fix submodule).
-- Queue-time abort: `SMB2RegressionTests/test_StatWithSealButNoKeyFailsFast`.
-- Refused connect: `SMB2RegressionTests/test_ConnectRefusedSurfacesConnectionRefused`.
-- Handle sweep: `SMB2RegressionTests/test_DestroyContextSweepsUnclosedHandles`.
-- fstat compound ordering:
-  `SMB2FileStatTests/testFstatCompoundAppliesLateTagWhenInfoRepliesFirst`
-  (mutation-checked against `4086bb7`).
-- Zero negotiated size:
-  `SMB2RegressionTests/test_{Read,Write}WithZeroNegotiatedSize…`
-  (mutation-checked against `8262429`: reverted, the Length field on the
-  wire is 65536 instead of 64).
-- Credit balance: `SMB2RegressionTests/test_NegativeCreditBalanceNeverInflatesQueuedRequests`
-  and `test_CreditGrantsAreCappedAtMaxCredits` (mutation-checked against
-  `bc5d2dd`: clamp, send gate and cap each reverted on its own fail a
-  case).
-- CSPRNG: `SMB2RegressionTests/test_RandomBytesComeFromAStrongSource`
-  asserts `smb2_random_bytes()` reports a strong source; it fails on
-  Darwin without `2078fae` and on Linux (Docker) without `bc5d2dd`.
-- Encoder-aligned write clamp:
-  `SMB2RegressionTests/test_WriteClampMatchesEncodeLayerForNonMultiCredit`
-  (mutation-checked: with the clamp removed the forged mid-window reply
-  is accepted and the expected error never comes). The getrandom flags
-  and the BSD branch have no automated test (blocking and other-BSD
-  behavior are not reachable from the test hosts).
+| Fix | Test |
+|---|---|
+| `933b2a4` compound lifetime | `SMB2LifetimeTests/test{Stat,Rename,Truncate,Readlink}CompoundPartialReplyTimeoutAbortsAllMembersCleanly` (ASan-only), `SMB2RegressionTests/test_StatWithSealButNoKeyFailsFast` |
+| `c3ea44c` refused connect | `SMB2RegressionTests/test_ConnectRefusedSurfacesConnectionRefused` |
+| `fd9b7dd` handle sweep | `SMB2RegressionTests/test_DestroyContextSweepsUnclosedHandles` |
+| `4086bb7` fstat ordering | `SMB2FileStatTests/testFstatCompoundAppliesLateTagWhenInfoRepliesFirst` |
+| `8262429` zero-size clamp | `SMB2RegressionTests/test_{Read,Write}WithZeroNegotiatedSize…` |
+| `bc5d2dd` credit balance | `SMB2RegressionTests/test_NegativeCreditBalanceNeverInflatesQueuedRequests`, `test_CreditGrantsAreCappedAtMaxCredits` |
+| `2078fae`/`bc5d2dd` CSPRNG | `SMB2RegressionTests/test_RandomBytesComeFromAStrongSource` |
+| `fee8b0e` write clamp | `SMB2RegressionTests/test_WriteClampMatchesEncodeLayerForNonMultiCredit` |
 
-### Known weak locks
+All of the above are mutation-checked (each fix reverted on its own fails
+its test). Known gaps, deliberate:
 
-- The compound-timeout cases pass even with `smb2_timeout_pdus()` stubbed
-  out: AMSMB2's `timeout + 2` Swift backstop produces the same ETIMEDOUT
-  (fifth re-check, round 12). They guard against the use-after-free under
-  ASan — reverting the pending-refcount fix crashes under ASan — and
-  `SMB2FileStatTests/testFstatTagTimeoutFailsFast` does kill the fan-out
-  stub, so the C fan-out itself is no longer lock-free.
+- The getrandom flags and the BSD branch have no automated test (blocking
+  and other-BSD behavior are not reachable from the test hosts).
+- `smb2_timeout_pdus()` fan-out: the compound-timeout cases pass with the
+  function stubbed out (the Swift `timeout + 2` backstop produces the same
+  ETIMEDOUT); `testFstatTagTimeoutFallsBack` does kill the stub.
 - `test_DestroyContextSweepsUnclosedHandles` passes with the sweep loop
-  removed (macOS has no LeakSanitizer); the sweep itself was verified
-  once with the malloc-zone probe described above.
+  removed (macOS has no LeakSanitizer); the sweep was verified once with a
+  malloc-zone probe.
+- `c2ca057`'s NameLength guard has no automated test (needs a mock that
+  the suite does not carry).
 
-## Known upstream limitations (documented, not carried as patches)
+## Known limitations (documented, not fixed)
 
-- A READ issued with length 0 through the raw API skips the
-  "data_length <= asked" check (`smb2-cmd-read.c`, `if (pdu->in.niov)`);
-  the bytes land in an internal buffer, not the caller's. AMSMB2 never
-  issues zero-length reads.
+Upstream behavior, unchanged in the fork:
+
+- `nterror_to_errno()`: `STATUS_OBJECT_NAME_INVALID` → EIO (misleading for
+  long-name rejections), `STATUS_LOGON_FAILURE` → ECONNREFUSED (auth
+  failure misreported as connection refusal).
 - The READ reply's DataOffset is read as 8 bits; a forged high byte is
-  ignored (the data is still taken from the stream position, bounded).
-- Hostile-server names: a FileName containing U+0000 is truncated by
-  `String(cString:)` on the Swift side, and names containing `\` are not
-  escaped when joined into paths. Both are name-confusion issues with a
-  malicious server, not memory-safety ones. The same truncation applies
-  to credentials taken from a URL (`smb://ad%00min:…` authenticates as
-  "ad"; Foundation only percent-decodes the user, not the password) and,
-  more practically, to deserialized managers: Codable accepts
-  `\u0000` escapes and NSSecureCoding accepts NSStrings carrying U+0000,
-  so hostile bookmark/config imports can inject them without a URL.
-  Deserialized managers also trust user/password fields over the URL.
-- Credits are granted into the balance before the reply is matched to a
-  request and before the signature check, so a replayed or
-  unknown-MessageId reply funds the balance (bounded by the MAX_CREDITS
-  cap; flow-control semantics only, no memory-safety impact). Verified
-  end-to-end in round 11: a funded balance cannot push a request past
-  the negotiated size clamp, and the worst outcome a funder achieves —
-  the server disconnecting on a credit violation — is no stronger than
-  the link control it already has.
-- Preauth/session protection: when the session requires signing,
-  libsmb2 already enforces that the final session-setup response is
-  signed and verifies it (session_setup_cb, upstream 053d960), and
-  SMB 3.1.1 tree-connect requests are unconditionally signed. The
-  real gap is sessions the server leaves unsigned and unencrypted:
-  AMSMB2 sets `securityMode = [.enabled]` (not `.required`), so the
-  protection level is the server's choice and a plaintext session has
-  no client-side handshake or data protection at all. Tightening this
-  is a product decision, not a defect fix. No client-side
-  SessionId/TreeId consistency check exists either (signed sessions
-  are protected by the signature covering the full header; encrypted
-  sessions by the transform-header SessionId check + AEAD).
-- `nterror_to_errno()` maps `STATUS_OBJECT_NAME_INVALID` (oversized
-  components, some servers' long-name rejections) into the generic EIO
-  bucket instead of `ENAMETOOLONG`/`EINVAL` — the error string misleads.
-  Upstream mapping, unchanged here.
-- The BSD `arc4random_buf` branch assumes FreeBSD ≥ 12 (older libc
-  lacks the symbol and would fail to link). Swift toolchains for
-  FreeBSD target 13/14; no supported configuration is affected.
-- The recursive listing walk is bounded by two budgets
-  (`recursiveListingMaxEntries` = 1,000,000 entries and
-  `recursiveListingMaxPathUTF16Count` = 8,192 UTF-16 units) so a hostile
-  server cannot walk forever or exhaust memory with fabricated directory
-  entries (the self-referential form keeps the path constant, so a path
-  cap alone never trips; the wide form grows ~2 GiB/s unbounded). The
-  budget helper is unit-tested; the walk's invocation of it has no
-  automated lock (a lying server would be required — an honest server
-  cannot exceed the caps). The same trust domain applies to a single
-  opendir that never ends: pages accumulate in the C layer until the
-  per-operation timeout, several GB on a fast link.
-- The full-parameter `SMB2FileHandle(path:…)` init trims before the
-  separator swap; a leading "/" used to become a leading "\" that
-  Samba's CREATE rejects (round-12 audit, harness-verified). No
-  automated lock: on the current test container the pre-fix error did
-  not reproduce a distinguishable signature.
-- `nterror_to_errno(STATUS_LOGON_FAILURE)` maps to ECONNREFUSED
-  (upstream): an authentication failure is misreported as a connection
-  refusal and misleads troubleshooting.
-- `seek(.end)` uses the file size snapshotted at open (upstream); writes
-  through the same handle do not update it. No in-repo caller uses
-  `.end`.
-- Paths are share-root-relative when they do not start with "/" and the
-  empty path means the share root for reads but fails differently
-  (EPERM/EEXIST/EACCES) per API — neither is documented in the API doc
-  comments.
-- A change-notify reply with an empty output buffer (MS-SMB2's "re-
-  enumerate the directory" signal) is swallowed as an empty change list.
-- Once observed (round 10; not reproduced since — four fresh Samba
-  4.23.8 containers, two full suites and 60 targeted runs all pass): a
-  CLOSE carrying SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB after DELETE_ON_CLOSE
-  had removed the object returned STATUS_OBJECT_NAME_NOT_FOUND. If this
-  recurs, that flag is the first suspect — the unlink/rmdir compound
-  never consumes the attribute, so dropping it is a safe fix.
+  ignored (data is still bounded).
+- A raw-API READ with length 0 skips the `data_length <= asked` check;
+  AMSMB2 never issues one.
+- `seek(.end)` uses the size snapshotted at open (no in-repo caller).
+- A half-received PDU escapes `smb2_timeout_pdus()`; the Swift
+  `timeout + 2` backstop covers it.
+- No client-side SessionId/TreeId consistency check (signed sessions are
+  covered by the signature, encrypted ones by the transform header; and
+  signed sessions already verify the final session-setup response — the
+  remaining gap is sessions the server leaves unsigned, where AMSMB2's
+  `securityMode = [.enabled]` defers protection to the server).
 
-- A reply whose body never completes (half-received PDU in `smb2->pdu`)
-  escapes `smb2_timeout_pdus`'s queue scan; AMSMB2's `timeout + 2`
-  backstop covers its callers.
-- The Apple build config has no accelerated AES backend (upstream only
-  defines `HAVE_COMMONCRYPTO_COMMONCRYPTOR_H` via CMake, and that backend
-  creates/releases a cryptor per 16-byte block anyway, cf. upstream issue
-  #500): SMB3 encryption/signing runs the portable C AES (~52 MB/s seal,
-  ~100 MB/s signing, measured on arm64). Fixing this needs CommonCrypto
-  cryptor reuse or armv8 crypto intrinsics.
+Hostile-server surfaces, bounded but accepted:
+
+- Credits are granted before the reply is matched or verified, so replays
+  can fund the balance (capped at `MAX_CREDITS`; flow-control only).
+- Names containing U+0000 are truncated by `String(cString:)` on the Swift
+  side; `\` in server names is not escaped when joined into paths. The
+  same truncation applies to URL user fields and to deserialized manager
+  credentials (Codable accepts `\u0000` escapes).
+- A single opendir that never returns NO_MORE_FILES accumulates pages in
+  the C layer until the per-operation timeout.
+
+AMSMB2-layer notes (recorded here for want of a better place):
+
+- Recursive listing enforces two budgets (`recursiveListingMaxEntries` =
+  1,000,000, `recursiveListingMaxPathUTF16Count` = 8,192) against
+  hostile-server walk loops; the helper is unit-tested, the walk's
+  invocation is not lockable without a lying-server mock.
+- The full-parameter `SMB2FileHandle(path:…)` init trims before the
+  separator swap (a leading `/` used to become a `\` Samba rejects); no
+  automated lock.
+- Paths without a leading `/` are share-root-relative; the empty path is
+  the share root for reads but fails inconsistently per API. Neither is
+  documented in the API doc comments.
+- A change-notify reply with an empty output buffer (the "re-enumerate"
+  signal) is swallowed as an empty change list.
+- Once observed, never reproduced: a CLOSE with POSTQUERY_ATTRIB after
+  DELETE_ON_CLOSE returned NAME_NOT_FOUND on Samba 4.23. If it recurs,
+  drop that flag — the unlink/rmdir compound never consumes the attribute.
+- The Apple build config has no accelerated AES backend: SMB3
+  encryption/signing runs the portable C AES (~52 MB/s seal, ~100 MB/s
+  signing on arm64). Fixing this needs CommonCrypto cryptor reuse or
+  armv8 crypto intrinsics (cf. upstream issue #500).
