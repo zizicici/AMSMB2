@@ -17,7 +17,8 @@ extension SMB2Manager {
     var __url: URL { url }
     
     /// The timeout interval to use when doing an operation until getting response. Default value is 60 seconds.
-    /// Set this to 0 or negative value in order to disable it.
+    /// Set this to 0, a negative value, or any non-finite value in order to disable it.
+    /// Positive values are rounded up to whole seconds and clamped to `Int32.max`.
     @available(swift, obsoleted: 1.0)
     @objc(timeout)
     public var __timeout: TimeInterval {
@@ -257,6 +258,27 @@ extension SMB2Manager {
     }
 
     /**
+     Sets the attributes of the specified file or directory.
+
+     - Parameters:
+       - attributes: A dictionary with `NSURLResourceKey` as key and the value to set.
+           Settable keys: `NSURLCreationDateKey`, `NSURLContentAccessDateKey`,
+           `NSURLContentModificationDateKey`, `NSURLAttributeModificationDateKey`,
+           `NSURLIsUserImmutableKey`, `NSURLIsSystemImmutableKey` and `NSURLIsHiddenKey`.
+       - atPath: path of file to be changed.
+       - completionHandler: closure will be run after changing attributes is completed.
+       - error: `NSError` if any occurred during changing attributes.
+     */
+    @available(swift, obsoleted: 1.0)
+    @objc(setAttributes:ofItemAtPath:completionHandler:)
+    public func __setAttributes(
+        attributes: [URLResourceKey: Any], ofItemAtPath path: String,
+        completionHandler: SimpleCompletionHandler
+    ) {
+        setAttributes(attributes: attributes, ofItemAtPath: path, completionHandler: completionHandler)
+    }
+
+    /**
      Returns the path of the item pointed to by a symbolic link.
 
      - Parameters:
@@ -391,8 +413,11 @@ extension SMB2Manager {
         completionHandler: @Sendable @escaping (_ contents: Data?, _ error: (any Error)?) -> Void
     ) {
         guard offset >= 0 else {
-            let error = POSIXError(.invalidArgument, description: "Invalid content offset.")
-            completionHandler(nil, error)
+            // Keep the documented "completions run on the internal queue"
+            // contract even on the validation-failure path.
+            queue {
+                completionHandler(nil, POSIXError(.invalidArgument, description: "Invalid content offset."))
+            }
             return
         }
 
@@ -522,6 +547,29 @@ extension SMB2Manager {
         completionHandler: SimpleCompletionHandler
     ) {
         uploadItem(at: url, toPath: toPath, progress: progress, completionHandler: completionHandler)
+    }
+
+    /**
+     Uploads local file contents to a new location, optionally overwriting an existing file.
+
+     - Note: given url must be local file url otherwise it will fail with error.
+
+     - Parameters:
+       - at: url of a local file to be uploaded from.
+       - toPath: path of new file to be uploaded to.
+       - overwrite: if `true`, replaces the file when it already exists at destination.
+       - progress: reports progress of written bytes count so far.
+           User must return `true` if they want to continuing or `false` to abort copying.
+       - completionHandler: closure will be run after uploading is completed.
+       - error: `NSError` if any occurred during uploading.
+     */
+    @available(swift, obsoleted: 1.0)
+    @objc(uploadItemAtURL:toPath:overwrite:progress:completionHandler:)
+    public func __uploadItem(
+        at url: URL, toPath: String, overwrite: Bool, progress: WriteProgressHandler,
+        completionHandler: SimpleCompletionHandler
+    ) {
+        uploadItem(at: url, toPath: toPath, overwrite: overwrite, progress: progress, completionHandler: completionHandler)
     }
     
     /**

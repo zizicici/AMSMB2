@@ -163,18 +163,38 @@ syncing, tag the new commit, update the pin above and the submodule pointer.
   escaped when joined into paths. Both are name-confusion issues with a
   malicious server, not memory-safety ones. The same truncation applies
   to credentials taken from a URL (`smb://ad%00min:…` authenticates as
-  "ad"); deserialized managers also trust user/password fields over the
-  URL.
+  "ad"; Foundation only percent-decodes the user, not the password) and,
+  more practically, to deserialized managers: Codable accepts
+  `\u0000` escapes and NSSecureCoding accepts NSStrings carrying U+0000,
+  so hostile bookmark/config imports can inject them without a URL.
+  Deserialized managers also trust user/password fields over the URL.
 - Credits are granted into the balance before the reply is matched to a
   request and before the signature check, so a replayed or
   unknown-MessageId reply funds the balance (bounded by the MAX_CREDITS
-  cap; flow-control semantics only, no memory-safety impact).
-- The SMB 3.1.1 preauth-integrity chain is fail-closed, but the closure
-  lands one PDU late: the final session-setup response is not verified
-  even when the server signed it, so the first verified PDU is the
-  tree-connect reply. Similarly, no client-side SessionId/TreeId
-  consistency check exists (signed sessions are protected by the
-  signature; plaintext sessions are inherently unprotected).
+  cap; flow-control semantics only, no memory-safety impact). Verified
+  end-to-end in round 11: a funded balance cannot push a request past
+  the negotiated size clamp, and the worst outcome a funder achieves —
+  the server disconnecting on a credit violation — is no stronger than
+  the link control it already has.
+- Preauth/session protection: when the session requires signing,
+  libsmb2 already enforces that the final session-setup response is
+  signed and verifies it (session_setup_cb, upstream 053d960), and
+  SMB 3.1.1 tree-connect requests are unconditionally signed. The
+  real gap is sessions the server leaves unsigned and unencrypted:
+  AMSMB2 sets `securityMode = [.enabled]` (not `.required`), so the
+  protection level is the server's choice and a plaintext session has
+  no client-side handshake or data protection at all. Tightening this
+  is a product decision, not a defect fix. No client-side
+  SessionId/TreeId consistency check exists either (signed sessions
+  are protected by the signature covering the full header; encrypted
+  sessions by the transform-header SessionId check + AEAD).
+- `nterror_to_errno()` maps `STATUS_OBJECT_NAME_INVALID` (oversized
+  components, some servers' long-name rejections) into the generic EIO
+  bucket instead of `ENAMETOOLONG`/`EINVAL` — the error string misleads.
+  Upstream mapping, unchanged here.
+- The BSD `arc4random_buf` branch assumes FreeBSD ≥ 12 (older libc
+  lacks the symbol and would fail to link). Swift toolchains for
+  FreeBSD target 13/14; no supported configuration is affected.
 - Once observed (round 10; not reproduced since — four fresh Samba
   4.23.8 containers, two full suites and 60 targeted runs all pass): a
   CLOSE carrying SMB2_CLOSE_FLAG_POSTQUERY_ATTRIB after DELETE_ON_CLOSE

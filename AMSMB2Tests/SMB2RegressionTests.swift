@@ -532,6 +532,10 @@ final class SMB2RegressionTests: XCTestCase {
         // it. With the 64 KiB default in makeClient the first size clamp
         // would mask the mutant.
         try client.withThreadSafeContext { $0.pointee.max_write_size = 1 << 20 }
+        // Lock-strength note: with credits < 8 the credit clamp alone would
+        // also reduce the count below the forged 512 KiB claim and this test
+        // would stop distinguishing the encoder-alignment clamp (see the
+        // round-11 mutation audit). makeClient's 32 leaves 4x margin.
         let finished = expectation(description: "Forging peer finished")
         DispatchQueue.global().async {
             defer { _ = close(peer); finished.fulfill() }
@@ -565,6 +569,48 @@ final class SMB2RegressionTests: XCTestCase {
         XCTAssertThrowsError(try file.write(data: Data(repeating: 0x42, count: 1 << 20))) { error in
             XCTAssertEqual((error as? POSIXError)?.code, .EIO)
         }
+    }
+
+    // MARK: validation failures still deliver completions asynchronously
+
+    func test_ValidationErrorsDeliverCompletionAsynchronously() {
+        // The class documents that completions run on an internal queue.
+        // The validation-failure paths (negative offset, unrepresentable
+        // date) used to call back synchronously on the caller's thread,
+        // which deadlocks callers that dispatch_sync back into that queue.
+        // Thread identity is compared via description (Thread itself is not
+        // Sendable; Thread.current returns the same instance — and thus the
+        // same description — for the same thread).
+        final class SendableBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = ""
+            func set(_ description: String) {
+                lock.lock(); value = description; lock.unlock()
+            }
+            func get() -> String {
+                lock.lock(); defer { lock.unlock() }; return value
+            }
+        }
+        let manager = SMB2Manager(url: URL(string: "smb://127.0.0.1")!, credential: nil)!
+        let callerDescription = Thread.current.description
+        let appendFinished = expectation(description: "append completion delivered")
+        let attributesFinished = expectation(description: "setAttributes completion delivered")
+        let appendBox = SendableBox()
+        let attributesBox = SendableBox()
+
+        manager.append(data: Data([1]), toPath: "file", offset: -5, progress: nil) { _ in
+            appendBox.set(Thread.current.description)
+            appendFinished.fulfill()
+        }
+        manager.setAttributes(
+            attributes: [.contentModificationDateKey: Date.distantPast], ofItemAtPath: "file"
+        ) { _ in
+            attributesBox.set(Thread.current.description)
+            attributesFinished.fulfill()
+        }
+        wait(for: [appendFinished, attributesFinished], timeout: 5)
+        XCTAssertNotEqual(appendBox.get(), callerDescription, "append completion must not run on the caller's thread")
+        XCTAssertNotEqual(attributesBox.get(), callerDescription, "setAttributes completion must not run on the caller's thread")
     }
 
     // MARK: teardown sweeps handles the caller never closed

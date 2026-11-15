@@ -306,7 +306,7 @@ private func receivePacket(_ fd: Int32) throws -> Data {
     }
     let prefix = try receive(4)
     let length = prefix.reduce(0) { ($0 << 8) | Int($1) }
-    guard length >= 64, length <= 65_536 else { throw POSIXError(.EIO) }
+    guard length >= 64, length <= 8 << 20 else { throw POSIXError(.EIO) }
     return try receive(length)
 }
 

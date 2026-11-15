@@ -715,6 +715,33 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         try await smb.disconnectShare(gracefully: true)
     }
 
+    func testDeepRecursiveListingAndRemoval() async throws {
+        // listDirectory used to recurse per subdirectory on 512 KiB GCD
+        // worker stacks and crashed around 340 levels deep in debug builds
+        // (~1500 in release) — with the depth driven entirely by the
+        // server's replies. 600 levels is comfortably past the debug
+        // boundary while staying under the server's PATH_MAX.
+        let root = folderName(postfix: "Deep")
+        let smb = SMB2Manager(url: server, credential: credential)!
+        addTeardownBlock {
+            try? await smb.removeDirectory(atPath: root, recursive: true)
+            try? await smb.disconnectShare(gracefully: true)
+        }
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.createDirectory(atPath: root)
+        var current = root
+        for level in 0..<600 {
+            current += "/d"
+            try await smb.createDirectory(atPath: current)
+            if level % 100 == 0 {
+                try await smb.write(data: Data([UInt8(level % 251)]), toPath: current + "/f", progress: nil)
+            }
+        }
+        let entries = try await smb.contentsOfDirectory(atPath: root, recursive: true)
+        XCTAssertEqual(entries.count, 600 + 6, "600 directories and 6 marker files")
+        try await smb.removeDirectory(atPath: root, recursive: true)
+    }
+
     func testRemove() async throws {
         let smb = SMB2Manager(url: server, credential: credential)!
 

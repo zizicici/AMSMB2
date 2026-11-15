@@ -650,7 +650,8 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
                 }
             }
         } catch {
-            completionHandler?(error)
+            // Same contract as everywhere else: never synchronous.
+            queue { completionHandler?(error) }
             return
         }
         
@@ -1049,7 +1050,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     }
 
     // **DEPRECATED, DON'T USE**
-    @available(swift, deprecated: 1)
+    @available(swift, deprecated: 1, message: "Use the range-based variants; this one reports progress through a side closure.")
     open func contents(
         atPath path: String, offset: Int64 = 0,
         fetchedData: @Sendable @escaping (_ offset: Int64, _ total: Int64, _ data: Data) -> Bool
@@ -1197,7 +1198,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         completionHandler: SimpleCompletionHandler
     ) {
         guard offset >= 0 else {
-            completionHandler?(POSIXError(.invalidArgument, description: "Offset must not be negative."))
+            // The class documents that completions run on the internal queue;
+            // calling back synchronously on the caller's thread deadlocks
+            // users who rely on that (e.g. dispatch_sync back into it).
+            queue {
+                completionHandler?(POSIXError(.invalidArgument, description: "Offset must not be negative."))
+            }
             return
         }
         let data = Data(data)
@@ -1591,7 +1597,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 }
 
 extension SMB2Manager {
-    private func queue(_ closure: @Sendable @escaping () -> Void) {
+    func queue(_ closure: @Sendable @escaping () -> Void) {
         operationLock.lock()
         operationCount += 1
         operationLock.unlock()
@@ -1714,29 +1720,30 @@ extension SMB2Manager {
         -> [[URLResourceKey: any Sendable]]
     {
         var contents = [[URLResourceKey: any Sendable]]()
-        let dir = try SMB2Directory(path.trimmedPath, on: client)
-        for ent in dir {
-            let name = ent.name
-            if [".", ".."].contains(name) { continue }
-            var result = [URLResourceKey: any Sendable]()
-            result[.nameKey] = name
-            result[.pathKey] = path.appendingPath(name, isDirectory: ent.st.isDirectory)
-            ent.st.populateResourceValue(&result)
-            contents.append(result)
-        }
-
-        if recursive {
-            let subDirectories = contents.filter(\.isDirectory)
-
-            for subDir in subDirectories {
-                try contents.append(
-                    contentsOf: listDirectory(
-                        client: client, path: subDir.path.unwrap(), recursive: true
-                    )
-                )
+        // Iterative DFS. This used to recurse per subdirectory on GCD worker
+        // threads (512 KiB stacks) and crashed at ~340 levels in debug /
+        // ~1500 in release — with the depth driven entirely by the server's
+        // replies. Pushing subdirectories in reverse keeps the old pre-order:
+        // a directory's entries, then each subtree completely before the
+        // next sibling.
+        var pending: [String] = [path]
+        while let current = pending.popLast() {
+            let dir = try SMB2Directory(current.trimmedPath, on: client)
+            var subDirectories = [String]()
+            for ent in dir {
+                let name = ent.name
+                if [".", ".."].contains(name) { continue }
+                var result = [URLResourceKey: any Sendable]()
+                result[.nameKey] = name
+                result[.pathKey] = current.appendingPath(name, isDirectory: ent.st.isDirectory)
+                ent.st.populateResourceValue(&result)
+                contents.append(result)
+                if recursive, ent.st.isDirectory {
+                    subDirectories.append(current.appendingPath(name, isDirectory: true))
+                }
             }
+            pending.append(contentsOf: subDirectories.reversed())
         }
-
         return contents
     }
 

@@ -372,7 +372,7 @@ private func receiveAll(_ fd: Int32, _ count: Int) throws -> Data {
 private func receivePacket(_ fd: Int32) throws -> Data {
     let prefix = try receiveAll(fd, 4)
     let count = prefix.reduce(0) { ($0 << 8) | Int($1) }
-    guard count >= 64, count <= 65_536 else { throw POSIXError(.EIO) }
+    guard count >= 64, count <= 8 << 20 else { throw POSIXError(.EIO) }
     return try receiveAll(fd, count)
 }
 
