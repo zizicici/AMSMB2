@@ -98,7 +98,9 @@ Fast-forward the fork's `master` mirror
 `master` into `watermelon`, re-run the guard in this repository
 (`make asan-test` — the compound-lifetime regressions only abort under
 AddressSanitizer), then tag the merge on `watermelon` and update the
-submodule pointer. Upstream's
+submodule pointer. When testing intermediate submodule commits, build
+with `swift test --scratch-path <dir>`: a shared `.build` produces
+stale results and drifting sanitizer reports across checkouts. Upstream's
 `libsmb2-6-branch` maintenance line carries client fixes that master
 absorbs with different patch-ids: compare by content, not patch-id, and
 if upstream ever merges our PR branches, prefer the fork's
