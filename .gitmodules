@@ -1,4 +1,4 @@
 [submodule "Dependencies/libsmb2"]
 	path = Dependencies/libsmb2
 	url = https://github.com/zizicici/libsmb2.git
-	branch = master
+	branch = watermelon

@@ -1,11 +1,12 @@
 # libsmb2 fork
 
-`Dependencies/libsmb2` tracks the `master` branch of
+`Dependencies/libsmb2` tracks the `watermelon` branch of
 [zizicici/libsmb2](https://github.com/zizicici/libsmb2) (see `branch` in
-`.gitmodules`; `git submodule update --remote` follows it), not upstream
-[sahlberg/libsmb2](https://github.com/sahlberg/libsmb2). `amsmb2-fork-N`
-tags mark reviewed pins — currently `amsmb2-fork-14` — and master moves
-only through them. The fork carries fixes that AMSMB2's teardown, timeout
+`.gitmodules`; `git submodule update --remote` follows it). The fork
+repo's `master` is a plain mirror of upstream
+[sahlberg/libsmb2](https://github.com/sahlberg/libsmb2) and never
+carries fork work; `amsmb2-fork-N` tags on `watermelon` mark reviewed
+pins — currently `amsmb2-fork-14`. The fork carries fixes that AMSMB2's teardown, timeout
 and hostile-input handling depend on; the regression suites assume them.
 
 ## Divergence from upstream (merged through upstream 161b89e)
@@ -92,10 +93,12 @@ Misc:
 
 ## Syncing with upstream
 
-Merge `upstream` (sahlberg/libsmb2) into the fork's `master`, re-run the
-guard in this repository (`make asan-test` — the compound-lifetime
-regressions only abort under AddressSanitizer), then tag the new commit
-and update the pin above and the submodule pointer. Upstream's
+Fast-forward the fork's `master` mirror
+(`git fetch upstream && git push origin upstream/master:master`), merge
+`master` into `watermelon`, re-run the guard in this repository
+(`make asan-test` — the compound-lifetime regressions only abort under
+AddressSanitizer), then tag the merge on `watermelon` and update the
+submodule pointer. Upstream's
 `libsmb2-6-branch` maintenance line carries client fixes that master
 absorbs with different patch-ids: compare by content, not patch-id, and
 if upstream ever merges our PR branches, prefer the fork's
