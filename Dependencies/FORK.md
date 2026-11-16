@@ -4,12 +4,16 @@
 [zizicici/libsmb2](https://github.com/zizicici/libsmb2) (see `branch` in
 `.gitmodules`; `git submodule update --remote` follows it), not upstream
 [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2). `amsmb2-fork-N`
-tags mark reviewed pins — currently `amsmb2-fork-13` — and master moves
+tags mark reviewed pins — currently `amsmb2-fork-14` — and master moves
 only through them. The fork carries fixes that AMSMB2's teardown, timeout
 and hostile-input handling depend on; the regression suites assume them.
 
-## Divergence from upstream (base a52c157)
+## Divergence from upstream (merged through upstream 161b89e)
 
+Upstream has absorbed PRs #510 (batch1) and #511 (shutdown-errno) —
+fork-14 merges that back. The fork's versions of the overlapping patches
+stay: they carry the parking-list machinery and later refinements the
+PRs predate. Remaining true divergence:
 Compound callback lifetime (use-after-free fixes, ASan-guarded):
 
 - `933b2a4` — compound callback state is reference-counted; every member
