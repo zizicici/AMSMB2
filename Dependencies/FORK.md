@@ -17,7 +17,8 @@ queued from an abort callback — the simple variant of what this fork
 had prototyped as a parking list). The fork's parking-list prototype was
 dropped in favor of his direction.
 
-`master..watermelon2` is now just the two open PRs:
+`master..watermelon` is now just the two open PRs (6 commits, strictly
+ahead — no divergence):
 
 - `pr-a` (upstream #514, open): reject forged write replies — the
   reply-count clamp, the on-wire-amount baseline and the pwrite-side
@@ -25,6 +26,12 @@ dropped in favor of his direction.
   the notify errno conversion.
 - `pr-b` (to submit after #514 merges; same clamp region): the credit
   balance bound and the zero-negotiated-size clamp skip.
+
+Branch layout: `master` = upstream mirror; `pr-a`/`pr-b` = staging
+branches for the open PRs (rebuild them, not `watermelon`, when a PR
+needs changes); `watermelon` = the assembled pin line, rebuilt as
+master + the open PR branches after each upstream sync. Historical
+lines are preserved under the `amsmb2-fork-N` tags.
 
 ## Syncing with upstream
 
