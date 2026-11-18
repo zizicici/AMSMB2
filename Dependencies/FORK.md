@@ -21,7 +21,27 @@ dropped in favor of his direction.
 
 The write-reply clamps went upstream as #514 (merged), together with
 the notify errno conversion. The pin line (`watermelon`) carries the
-staged lines on top of upstream master, each strictly ahead:
+staged lines on top of upstream master, each strictly ahead. A large
+externally-authored batch (40+ commits as of the last review,
+four-agent reviewed: core lifetime, notify/symlink, tools/crypto,
+build systems — all verdicts PASS) sits on the standalone repo's local
+watermelon ahead of the pushed/reviewed base `12b46cf`, NOT yet pushed
+and still moving; it adds and will join the pin once pushed and
+delta-reviewed: implicit-offset
+I/O serialization with drain-before-close, POSIX-correct
+out-of-range seek, open-cancellation detachment, server-side-copy
+callback lifetime, sync connect/disconnect isolation (fixes the old
+disconnect-returns-0-with-fd-open on the success path), notify
+surviving interim replies (was a UAF under passthrough), directory
+watch opens without host O_DIRECTORY, SET_INFO passthrough header
+lengths, smb2-cp alias protection and EOF/short-write handling
+(verified live: the old binary destroyed aliased sources and spun on
+sysfs), an RFC 3610 + OpenSSL-compatible 64-bit AAD length encoder
+(generalizing the fork's extended-encoding fix), embedded random
+providers (Switch/3DS/ESP32/AmigaOS4; the weak random() fallback is
+deleted), `smb2_queue_pdu_checked` with DCE/RPC propagation, native
+MinGW builds, macOS cmake fixes (Kerberos link, public-header
+self-containment), and Amiga/AROS SDK catch-up. The staged lines:
 
 - `pr-b` (three commits): the zero-negotiated-size clamp skip and the
   credit balance bound (these two are the credit PR, same clamp region
@@ -141,8 +161,10 @@ read stream).
   also publishes the client before the connect completes, so racing
   operations fail ENOTCONN during that window.
 - Latent, unreachable-from-the-library seams, kept as notes:
-  `async_await_pdu` ignores `queue_rejected` (only set when queueing
-  from an abort callback, which the Swift layer never does);
+  `async_await_pdu` still queues through the void `smb2_queue_pdu`
+  rather than the new `smb2_queue_pdu_checked`, so a synchronously
+  rejected PDU surfaces only via the timeout backstop (the C layer now
+  propagates rejection; switching the Swift call site is future work);
   `monitorItem` on a symlink fails (its `.link` arm is dead, no
   open-as-reparse fallback); Codable defaults a missing `user` to ""
   where NSSecureCoding defaults to "guest"; `uploadItem` surfaces a
@@ -162,8 +184,19 @@ read stream).
   `-O3 -Wall -Werror` trips `-Wmaybe-uninitialized` on the CMAC iov
   fast path — the same warning upstream's AES-NI twin produces, so a
   pre-existing pattern, not this fork's; AROS also has no CI job, and
-  the only public AROS toolchain container cannot build the tree
-  (upstream `sys/unistd.h` gap).
+  the only public AROS toolchain container cannot build the tree (its
+  SDK lacks stdint.h/time.h/unistd.h entirely — broader than the old
+  sys/unistd.h note).
+- Destroying the context from inside a file-completion callback
+  remains undefined (pre-existing class; the new implicit-offset queue
+  changes the failure shape — the completion loop would walk a freed
+  handle when more ops are queued — but the usage was never supported).
+  Unlinking a directory symlink still returns EISDIR on stock Samba:
+  the handle-based attribute-tag verification needs a tag-reporting
+  server (Windows, or Samba with the smb_reparse VFS module); Samba
+  answers the tag query without the REPARSE bit, so the capability is
+  inert there. libsmb2 CI runs no test suite at all (no `make check`
+  step), so the batch's new regression tests only run locally.
 - Upstream's Apple build config has no accelerated AES backend: SMB3
   encryption/signing runs the portable C AES (~52 MB/s seal, ~100 MB/s
   signing on arm64; cf. upstream issue #500). The fork's answer is
