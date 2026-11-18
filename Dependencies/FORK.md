@@ -12,7 +12,7 @@ pins — currently `amsmb2-fork-16` (on the pre-#521 line; the
 ## State after the November 2026 upstream sync
 
 Upstream absorbed most of the fork's line through #510, #511, #512,
-#513, #515 (NameLength wrap + reply-encoder stride), #516 (compound
+#515 (NameLength wrap + reply-encoder stride), #516 (compound
 callback lifetime), #517 (CSPRNG selection) and Ronnie's own follow-ups
 (non-blocking getrandom; the queue_rejected disposition for commands
 queued from an abort callback — the simple variant of what this fork
@@ -23,9 +23,11 @@ The write-reply clamps went upstream as #514 (merged), together with
 the notify errno conversion. The pin line (`watermelon-2`) carries the
 two staged lines on top of upstream master, each strictly ahead:
 
-- `pr-b`: the credit balance bound and the zero-negotiated-size clamp
-  skip (same clamp region as #514; submit once its follow-up window
-  opens).
+- `pr-b` (two commits): the credit balance bound plus the
+  zero-negotiated-size clamp skip (same clamp region as #514), and a
+  separate hygiene commit fixing the query-directory reply overlap
+  check constant (numerically a no-op today; submit separately so the
+  credit PR stays single-purpose).
 - `pr-aes` (upstream #521, open): AES-128 on the ARMv8 crypto
   extensions — the x86 AES-NI treatment ported to arm64, with a
   runtime `getauxval`/architectural dispatch and portable stubs where
@@ -46,8 +48,11 @@ Fast-forward the fork's `master` mirror
 rebuild `watermelon-2` as master plus the open PR branches, re-run the
 guard in this repository (`swift test` with a fresh `--scratch-path`,
 plus `make asan-test` — the compound-lifetime regressions only abort
-under AddressSanitizer), then tag the pin on `watermelon-2` and update
-the submodule pointer. When testing intermediate submodule commits,
+under AddressSanitizer), then refresh the copied (non-symlink) headers under
+`Dependencies/smb2-module/` against the submodule's (the module map
+imports the submodule's headers while the C target compiles against
+the copies), tag the pin on `watermelon-2` and update the submodule
+pointer. When testing intermediate submodule commits,
 build with `swift test --scratch-path <dir>`: a shared `.build`
 produces stale results and drifting sanitizer reports across
 checkouts.
@@ -59,9 +64,15 @@ handle-sweep tests now guard upstream-merged code and stay as
 regression walls. Fork-specific guards: `test_WriteClampMatchesEncodeLayerForNonMultiCredit`
 and the zero-progress write test (upstream #514 content),
 `test_NegativeCreditBalanceNeverInflatesQueuedRequests`
-and `test_CreditGrantsAreCappedAtMaxCredits` (pr-b content),
-`test_RandomBytesComeFromAStrongSource` (upstream CSPRNG selection —
-kept because it fails if a future config regression drops the define).
+`test_CreditGrantsAreCappedAtMaxCredits` and the zero-negotiated-size
+pair `test_ReadWithZeroNegotiatedSizeRequestsExactlyTheCallerLength` /
+`test_WriteWithZeroNegotiatedSizeSendsExactlyTheCallerBytes` (pr-b
+content), `test_RandomBytesComeFromAStrongSource` (upstream CSPRNG
+selection — kept because it fails if a future config regression drops
+the define), and `testSetAttributesMergeAndClearImmutable` /
+`testStreamReadCompleteForSlowConsumer` (this round's Swift fixes:
+attribute read-modify-write with flag preservation, and the pull-driven
+read stream).
 
 ## Known limitations (documented, not fixed)
 
@@ -95,8 +106,40 @@ kept because it fails if a future config regression drops the define).
   in-library callers stay inside the safe domain (nonce 11, tag 16,
   bounded AAD/payload), so these are unreachable from AMSMB2; a future
   parameter-domain sweep for the portable path would cover both.
+- Task cancellation is not propagated into in-flight SMB2 commands
+  (no `withTaskCancellationHandler` anywhere): a cancelled task's
+  command still runs to completion or timeout, and with `timeout = 0`
+  a stalled operation parks its continuation, a GCD thread and the
+  open handle forever — including graceful `disconnectShare`. The
+  default 60 s timeout bounds the damage everywhere else.
+- Every operation holds the per-client recursive lock across its whole
+  blocking poll wait, so concurrent operations on one connection occupy
+  one GCD thread each (no cancellation, no priority inheritance; the
+  Swift cooperative pool is never blocked). `connect(shareName:)`
+  also publishes the client before the connect completes, so racing
+  operations fail ENOTCONN during that window.
+- Latent, unreachable-from-the-library seams, kept as notes:
+  `async_await_pdu` ignores `queue_rejected` (only set when queueing
+  from an abort callback, which the Swift layer never does);
+  `monitorItem` on a symlink fails (its `.link` arm is dead, no
+  open-as-reparse fallback); Codable defaults a missing `user` to ""
+  where NSSecureCoding defaults to "guest"; `uploadItem` surfaces a
+  CocoaError (not the documented POSIX one) for unreachable sources
+  and silently ignores passwords embedded in URLs; a multi-backslash
+  username like `a\b\c` silently degrades to guest;
+  `AsyncThrowingStream(url:)` reads the whole local file synchronously
+  in `init` (test-harness convenience; the read-side network stream
+  is pull-driven since this round).
+- C build surface: the CMake and SwiftPM shared libraries export the
+  ARMv8 internals (like their other ~430 internal exports; autotools
+  has a version script and does not), and on non-Apple non-Linux
+  aarch64 targets (BSD/Windows/Android) the runtime probe returns 0,
+  so those builds keep the portable path. Upstream's autotools also
+  fails in libdcerpc under `--without-libkrb5` on a pristine
+  checkout — pre-existing, not this fork's.
 - Upstream's Apple build config has no accelerated AES backend: SMB3
   encryption/signing runs the portable C AES (~52 MB/s seal, ~100 MB/s
   signing on arm64; cf. upstream issue #500). The fork's answer is
   `pr-aes` / upstream #521 (ARMv8 crypto extensions, ~0.9 GB/s seal,
-  ~2.4 GB/s signing); `watermelon` picks it up once it merges.
+  ~2.4 GB/s signing), which the pin line already carries ahead of the
+  merge.

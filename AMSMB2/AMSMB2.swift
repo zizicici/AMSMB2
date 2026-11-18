@@ -590,7 +590,7 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
     
     /**
      Sets the attributes of the specified file or directory.
-     
+
      - Parameters:
        - attributes: A dictionary containing as keys the attributes to set for path
             and as values the corresponding value for the attribute.
@@ -598,7 +598,10 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             `contentModificationDateKey`, `attributeModificationDateKey`,
             `isUserImmutableKey`, `isSystemImmutableKey` and `isHiddenKey`.
             You can change single attributes or any combination of attributes;
-            you need not specify keys for all attributes.
+            you need not specify keys for all attributes. Attribute flags the
+            dictionary does not mention keep their current values, and a `false`
+            value clears the corresponding flag. Values of the wrong type are
+            rejected with an error instead of being ignored.
        - path: The path of a file or directory.
        - completionHandler: closure will be run after operation is completed.
      */
@@ -608,43 +611,42 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
         completionHandler: SimpleCompletionHandler
     ) {
         var stat = smb2_stat_64()
-        var smb2Attributes = SMB2FileHandle.Attributes()
+        var flagUpdates: [(set: SMB2FileHandle.Attributes, clear: SMB2FileHandle.Attributes)] = []
+        func typeError(_ key: URLResourceKey) -> POSIXError {
+            .init(.invalidArgument, description: "Wrong value type for \(key).")
+        }
         do {
             for attribute in attributes {
                 switch attribute.key {
                 case .creationDateKey:
-                    if let date = attributes.creationDate {
-                        let timestamp = try SMB2Timestamp(date)
-                        stat.smb2_btime = timestamp.seconds
-                        stat.smb2_btime_nsec = timestamp.nanoseconds
-                    }
+                    guard let date = attribute.value as? Date else { throw typeError(attribute.key) }
+                    let timestamp = try SMB2Timestamp(date)
+                    stat.smb2_btime = timestamp.seconds
+                    stat.smb2_btime_nsec = timestamp.nanoseconds
                 case .contentAccessDateKey:
-                    if let date = attributes.contentAccessDate {
-                        let timestamp = try SMB2Timestamp(date)
-                        stat.smb2_atime = timestamp.seconds
-                        stat.smb2_atime_nsec = timestamp.nanoseconds
-                    }
+                    guard let date = attribute.value as? Date else { throw typeError(attribute.key) }
+                    let timestamp = try SMB2Timestamp(date)
+                    stat.smb2_atime = timestamp.seconds
+                    stat.smb2_atime_nsec = timestamp.nanoseconds
                 case .contentModificationDateKey:
-                    if let date = attributes.contentModificationDate {
-                        let timestamp = try SMB2Timestamp(date)
-                        stat.smb2_mtime = timestamp.seconds
-                        stat.smb2_mtime_nsec = timestamp.nanoseconds
-                    }
+                    guard let date = attribute.value as? Date else { throw typeError(attribute.key) }
+                    let timestamp = try SMB2Timestamp(date)
+                    stat.smb2_mtime = timestamp.seconds
+                    stat.smb2_mtime_nsec = timestamp.nanoseconds
                 case .attributeModificationDateKey:
-                    if let date = attributes.attributeModificationDate {
-                        let timestamp = try SMB2Timestamp(date)
-                        stat.smb2_ctime = timestamp.seconds
-                        stat.smb2_ctime_nsec = timestamp.nanoseconds
-                    }
+                    guard let date = attribute.value as? Date else { throw typeError(attribute.key) }
+                    let timestamp = try SMB2Timestamp(date)
+                    stat.smb2_ctime = timestamp.seconds
+                    stat.smb2_ctime_nsec = timestamp.nanoseconds
                 case .isUserImmutableKey:
-                    guard let value = attribute.value as? Bool else { break }
-                    smb2Attributes.insert(value ? .readonly : .normal)
+                    guard let value = attribute.value as? Bool else { throw typeError(attribute.key) }
+                    flagUpdates.append(value ? (.readonly, []) : ([], .readonly))
                 case .isSystemImmutableKey:
-                    guard let value = attribute.value as? Bool else { break }
-                    smb2Attributes.insert(value ? .system : .normal)
+                    guard let value = attribute.value as? Bool else { throw typeError(attribute.key) }
+                    flagUpdates.append(value ? (.system, []) : ([], .system))
                 case .isHiddenKey:
-                    guard let value = attribute.value as? Bool else { break }
-                    smb2Attributes.insert(value ? .hidden : .normal)
+                    guard let value = attribute.value as? Bool else { throw typeError(attribute.key) }
+                    flagUpdates.append(value ? (.hidden, []) : ([], .hidden))
                 default:
                     break
                 }
@@ -654,15 +656,34 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             queue { completionHandler?(error) }
             return
         }
-        
-        if smb2Attributes.subtracting(.normal) != [] {
-            smb2Attributes.remove(.normal)
-        }
-        
-        with(completionHandler: completionHandler) { [stat, smb2Attributes] client in
-            let file = try SMB2FileHandle(forUpdatingAtPath: path, on: client)
+
+        with(completionHandler: completionHandler) { [stat, flagUpdates] client in
+            // Attribute-only access: no data read or write, so servers allow
+            // this on files the caller can neither read nor write — which is
+            // what makes clearing a readonly/immutable flag possible at all.
+            let file = try SMB2FileHandle(
+                path: path,
+                desiredAccess: [.fileReadAttributes, .fileWriteAttributes, .synchronize],
+                shareAccess: [.read, .write],
+                createDisposition: .open,
+                on: client
+            )
             defer { try? file.close() }
-            try file.set(stat: stat, attributes: smb2Attributes)
+            // The wire field is a full replacement (0 = leave unchanged), so
+            // merge the caller's flags into the file's current word instead
+            // of clobbering flags the dictionary does not mention.
+            var word = SMB2FileHandle.Attributes()
+            if !flagUpdates.isEmpty {
+                word = SMB2FileHandle.Attributes(
+                    rawValue: try file.fstat().smb2_attributes
+                ).subtracting(.normal)
+                for update in flagUpdates {
+                    word.formUnion(update.set)
+                    word.subtract(update.clear)
+                }
+                if word.isEmpty { word = .normal }
+            }
+            try file.set(stat: stat, attributes: word)
         }
     }
     
@@ -1074,50 +1095,37 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
        - atPath: path of file to be fetched.
        - range: byte range that should be read, default value is whole file. e.g. `..<10` will read first ten bytes.
      - Returns: an async stream of `Data` object which contains file contents.
+
+     The stream is pull-driven: each chunk is read from the server only when the
+     consumer asks for the next element, so memory stays at one chunk no matter
+     how slow the consumer is or how large the file is.
      */
     @available(swift 5.9)
     open func contents<R: RangeExpression>(
         atPath path: String, range: R? = Range<UInt64>?.none
     ) -> AsyncThrowingStream<Data, any Error> where R.Bound: FixedWidthInteger {
         let range = range?.int64Range ?? 0..<Int64.max
-        let (result, continuation) = AsyncThrowingStream<Data, any Error>.makeStream(bufferingPolicy: .unbounded)
-        let consumerGone = StreamConsumerGone()
-        continuation.onTermination = { _ in
-            consumerGone.set()
-        }
+        let client = self.client
 
-        queue { [client] in
-            guard let client = client else {
-                // Never leave the consumer awaiting a stream that cannot
-                // produce anything.
-                continuation.finish(
-                    throwing: POSIXError(.socketNotConnected, description: nil)
-                )
-                return
-            }
-            var offset = range.lowerBound
-            do {
-                let file = try SMB2FileHandle(forReadingAtPath: path, on: client)
-                defer { try? file.close() }
-                try file.seek(offset: range.lowerBound, from: .start)
-                while offset < range.upperBound, !consumerGone.isGone {
-                    // Read optimal read size, or less if less is remaining.
-                    let remainingLength = range.upperBound - offset
-                    let optimizedReadSize = file.optimizedReadSize
-                    let length = remainingLength < optimizedReadSize ? Int(remainingLength) : optimizedReadSize
-                    let data = try file.read(length: length)
-                    if data.isEmpty {
-                        break
+        let cursor = SMB2StreamReadCursor(client: client, path: path, offset: range.lowerBound, upperBound: range.upperBound)
+        return AsyncThrowingStream(unfolding: { () async throws -> Data? in
+            // Hop the blocking read off the consumer's cooperative thread
+            // onto a GCD thread (where the eager producer this replaces used
+            // to run); the consumer suspends instead of blocking. Iteration
+            // is serial per the stream contract, so the cursor is pulled one
+            // chunk at a time. A consumer that abandons the stream mid-way
+            // leaves the handle to the client's destroy sweep, like every
+            // other unclosed handle.
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global().async {
+                    do {
+                        continuation.resume(returning: try cursor.nextChunk())
+                    } catch {
+                        continuation.resume(throwing: error)
                     }
-                    continuation.yield(data.prefix(Int(clamping: range.upperBound - offset)))
-                    offset += Int64(data.count)
                 }
-                continuation.finish()
-            } catch {
-                continuation.finish(throwing: error)
             }
-        }
-        return result
+        })
     }
     
     /**
@@ -2023,21 +2031,65 @@ extension SMB2Manager {
 }
 
 
-/// Tracks whether the consumer of `contents(atPath:range:)`'s stream is
-/// still interested, so the producing loop can stop once it is terminated.
-final class StreamConsumerGone: @unchecked Sendable {
-    private let lock = NSLock()
-    private var gone = false
+/// Pulls `contents(atPath:range:)`'s stream one chunk at a time. Every
+/// access happens on the GCD thread a pull hops to; pulls are serial per
+/// the stream contract, hence @unchecked Sendable.
+final class SMB2StreamReadCursor: @unchecked Sendable {
+    let client: SMB2Client?
+    let path: String
+    let upperBound: Int64
+    var file: SMB2FileHandle?
+    var offset: Int64
+    var finished = false
 
-    func set() {
-        lock.lock()
-        gone = true
-        lock.unlock()
+    init(client: SMB2Client?, path: String, offset: Int64, upperBound: Int64) {
+        self.client = client
+        self.path = path
+        self.offset = offset
+        self.upperBound = upperBound
     }
 
-    var isGone: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return gone
+    func finish() {
+        finished = true
+        let open = file
+        file = nil
+        try? open?.close()
+    }
+
+    func nextChunk() throws -> Data? {
+        guard !finished, offset < upperBound else {
+            finish()
+            return nil
+        }
+        guard let client else {
+            finished = true
+            throw POSIXError(.socketNotConnected, description: nil)
+        }
+        let handle: SMB2FileHandle
+        if let file {
+            handle = file
+        } else {
+            handle = try SMB2FileHandle(forReadingAtPath: path, on: client)
+            try handle.seek(offset: offset, from: .start)
+            file = handle
+        }
+        do {
+            // Read optimal read size, or less if less is remaining.
+            let remainingLength = upperBound - offset
+            let optimizedReadSize = handle.optimizedReadSize
+            let length = remainingLength < optimizedReadSize ? Int(remainingLength) : optimizedReadSize
+            let data = try handle.read(length: length)
+            if data.isEmpty {
+                finish()
+                return nil
+            }
+            let chunk = data.prefix(Int(clamping: upperBound - offset))
+            offset += Int64(data.count)
+            if offset >= upperBound { finish() }
+            return chunk
+        } catch {
+            finish()
+            throw error
+        }
     }
 }

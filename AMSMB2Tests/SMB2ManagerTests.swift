@@ -166,6 +166,80 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         let renamedData = try await smb.contents(atPath: renamedFile)
         XCTAssertEqual(data, renamedData)
     }
+
+    /// Guards the setAttributes read-modify-write: attribute flags the
+    /// dictionary does not mention must survive, `false` must clear a flag
+    /// (which used to be impossible: the old read/write open was denied on a
+    /// readonly file), and mistyped values must surface as errors.
+    func testSetAttributesMergeAndClearImmutable() async throws {
+        let file = fileName()
+        let smb = SMB2Manager(url: server, credential: credential)!
+        let data = randomData(size: 16)
+
+        addTeardownBlock {
+            // Clear the immutable flag first or the removal is denied.
+            try? await smb.setAttributes(attributes: [.isUserImmutableKey: false], ofItemAtPath: file)
+            try? await smb.removeFile(atPath: file)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.write(data: data, toPath: file, progress: nil)
+
+        func flags() async throws -> (hidden: Bool, immutable: Bool) {
+            let values = try await smb.attributesOfItem(atPath: file)
+            return (values[.isHiddenKey] as? Bool ?? false, values[.isUserImmutableKey] as? Bool ?? false)
+        }
+
+        let initial = try await flags()
+        XCTAssertEqual(initial.hidden, false)
+
+        try await smb.setAttributes(attributes: [.isHiddenKey: true], ofItemAtPath: file)
+        let hidden = try await flags()
+        XCTAssertEqual(hidden.hidden, true)
+
+        try await smb.setAttributes(attributes: [.isUserImmutableKey: true], ofItemAtPath: file)
+        let immutable = try await flags()
+        XCTAssertEqual(immutable.immutable, true)
+        XCTAssertEqual(immutable.hidden, true, "unmentioned flags must survive")
+
+        try await smb.setAttributes(attributes: [.isUserImmutableKey: false], ofItemAtPath: file)
+        let cleared = try await flags()
+        XCTAssertEqual(cleared.immutable, false)
+        XCTAssertEqual(cleared.hidden, true, "clearing one flag must keep the others")
+
+        do {
+            try await smb.setAttributes(attributes: [.isHiddenKey: "yes"], ofItemAtPath: file)
+            XCTFail("Expected an invalid-argument error for a mistyped value")
+        } catch let error as POSIXError {
+            XCTAssertEqual(error.code, .EINVAL)
+        }
+    }
+
+    /// Guards the pull-driven read stream: a slow consumer still receives the
+    /// complete file across multiple chunks.
+    func testStreamReadCompleteForSlowConsumer() async throws {
+        let file = fileName()
+        let smb = SMB2Manager(url: server, credential: credential)!
+        // Larger than one negotiated chunk so several pulls are exercised.
+        let data = randomData(size: 9 * 1_048_576 + 1234)
+
+        addTeardownBlock {
+            try? await smb.removeFile(atPath: file)
+        }
+
+        try await smb.connectShare(name: share, encrypted: encrypted)
+        try await smb.write(data: data, toPath: file, progress: nil)
+
+        var collected = Data()
+        var chunks = 0
+        for try await chunk in smb.contents(atPath: file) {
+            collected.append(chunk)
+            chunks += 1
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTAssertEqual(collected, data)
+        XCTAssertGreaterThan(chunks, 1)
+    }
     
     func testFileTruncate() async throws {
         let file = fileName()

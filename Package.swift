@@ -46,6 +46,11 @@ let package = Package(
                 "libsmb2/lib/Makefile.PS3_PPU",
                 "libsmb2/lib/ps2",
                 "libsmb2/lib/dreamcast",
+                // A CMake build inside the submodule leaves .o files and
+                // archives here; without the excludes SwiftPM reports a
+                // "no rule to process file" warning for every one of them.
+                "libsmb2/lib/obj",
+                "libsmb2/lib/bin",
                 "libsmb2/include/module.modulemap",
             ],
             sources: [
