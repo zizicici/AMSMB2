@@ -900,36 +900,6 @@ class SMB2ManagerTests: XCTestCase, @unchecked Sendable {
         try await smb.removeDirectory(atPath: "\(folderName())", recursive: true)
     }
     
-    func testMonitor() async throws {
-        try XCTSkipIf(true)
-        let smb = SMB2Manager(url: server, credential: credential)!
-
-        addTeardownBlock {
-            try? await smb.removeDirectory(atPath: "\(folderName())", recursive: true)
-        }
-
-        try await smb.connectShare(name: share, encrypted: encrypted)
-        try await smb.createDirectory(atPath: "\(folderName())")
-        try await smb.createDirectory(atPath: "\(folderName())/subdir")
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                do {
-                    let changes = try await smb.monitorItem(atPath: "\(folderName())", for: [.fileName, .recursive])
-                    XCTAssert(!changes.isEmpty)
-                    print(changes)
-                } catch {
-                    print(error)
-                    throw error
-                }
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-                try await smb.write(data: Data(), toPath: "\(folderName())/file", progress: nil)
-            }
-            try await group.waitForAll()
-        }
-        try await smb.removeDirectory(atPath: "\(folderName())", recursive: true)
-    }
 }
 
 extension SMB2ManagerTests {
