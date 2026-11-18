@@ -1,13 +1,13 @@
 # libsmb2 fork
 
-`Dependencies/libsmb2` tracks the `watermelon-2` branch of
+`Dependencies/libsmb2` tracks the `watermelon` branch of
 [zizicici/libsmb2](https://github.com/zizicici/libsmb2) (see `branch` in
-`.gitmodules`) — upstream master plus both staged lines (`pr-b` and
-#521's AES). The fork repo's `master` is a plain mirror of upstream
+`.gitmodules`) — upstream master plus the staged lines (pr-b, the
+codex-round fixes and #521's AES). The fork repo's `master` is a plain mirror of upstream
 [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2) and never
 carries fork work; `amsmb2-fork-N` tags on the pin line mark reviewed
-pins — currently `amsmb2-fork-16` (on the pre-#521 line; the
-`watermelon-2` tip gets its tag after the current review round).
+pins — currently `amsmb2-fork-16`; the `watermelon` tip gets its tag
+after the current round's PR split is confirmed.
 
 ## State after the November 2026 upstream sync
 
@@ -20,35 +20,41 @@ had prototyped as a parking list). The fork's parking-list prototype was
 dropped in favor of his direction.
 
 The write-reply clamps went upstream as #514 (merged), together with
-the notify errno conversion. The pin line (`watermelon-2`) carries the
-two staged lines on top of upstream master, each strictly ahead:
+the notify errno conversion. The pin line (`watermelon`) carries the
+staged lines on top of upstream master, each strictly ahead:
 
 - `pr-b` (three commits): the zero-negotiated-size clamp skip and the
   credit balance bound (these two are the credit PR, same clamp region
   as #514), plus a separate hygiene commit fixing the query-directory
   reply overlap check constant (numerically a no-op today; submit
   separately so the credit PR stays single-purpose).
+- five fixes from the codex review round: share-enum use-after-free
+  when queueing fails a PDU synchronously, `rmdir()` deleting plain
+  files (missing `SMB2_FILE_DIRECTORY_FILE`), the change-notify error
+  branch leaking the server-side directory handle, random draws
+  silently degrading to an unseeded `/dev/urandom` at early boot, and
+  the DCE/RPC call tracking its pdu after a synchronously failed send.
 - `pr-aes` (upstream #521, open): AES-128 on the ARMv8 crypto
   extensions — the x86 AES-NI treatment ported to arm64, with a
   runtime `getauxval`/architectural dispatch and portable stubs where
   the extension is unavailable. A single commit on top of upstream
   master.
 
-Branch layout: `master` = upstream mirror; `pr-aes`/`pr-b` = staging
-branches for the open PRs (rebuild them, not the pin line, when a PR
-needs changes); `watermelon-2` = the assembled pin line, rebuilt as
-master + the open PR branches after each upstream sync (`watermelon`
-was the pre-#521 pin line and stays as the pr-b-equivalent tip).
-Historical lines are preserved under the `amsmb2-fork-N` tags.
+Branch layout: `master` = upstream mirror; `pr-aes`/`pr-b`/the codex
+fixes = staging commits for the open PRs (rebuild the staging branches,
+not the pin line, when a PR needs changes); `watermelon` = the
+assembled pin line, rebuilt as master + the staged lines after each
+upstream sync. Historical lines are preserved under the
+`amsmb2-fork-N` tags.
 
 ## Syncing with upstream
 
 Fast-forward the fork's `master` mirror
 (`git fetch upstream && git push origin upstream/master:master`),
-rebuild `watermelon-2` as master plus the open PR branches, re-run the
+rebuild `watermelon` as master plus the staged lines, re-run the
 guard in this repository (`swift test` with a fresh `--scratch-path`,
 plus `make asan-test` — the compound-lifetime regressions only abort
-under AddressSanitizer), then tag the pin on `watermelon-2` and update the submodule
+under AddressSanitizer), then tag the pin on `watermelon` and update the submodule
 pointer. (`Dependencies/smb2-module/` resolves entirely through
 symlinks into the submodule's headers — there are no copied headers
 to refresh.) When testing intermediate submodule commits,
