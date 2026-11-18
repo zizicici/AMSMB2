@@ -23,11 +23,11 @@ The write-reply clamps went upstream as #514 (merged), together with
 the notify errno conversion. The pin line (`watermelon-2`) carries the
 two staged lines on top of upstream master, each strictly ahead:
 
-- `pr-b` (two commits): the credit balance bound plus the
-  zero-negotiated-size clamp skip (same clamp region as #514), and a
-  separate hygiene commit fixing the query-directory reply overlap
-  check constant (numerically a no-op today; submit separately so the
-  credit PR stays single-purpose).
+- `pr-b` (three commits): the zero-negotiated-size clamp skip and the
+  credit balance bound (these two are the credit PR, same clamp region
+  as #514), plus a separate hygiene commit fixing the query-directory
+  reply overlap check constant (numerically a no-op today; submit
+  separately so the credit PR stays single-purpose).
 - `pr-aes` (upstream #521, open): AES-128 on the ARMv8 crypto
   extensions — the x86 AES-NI treatment ported to arm64, with a
   runtime `getauxval`/architectural dispatch and portable stubs where
@@ -48,11 +48,10 @@ Fast-forward the fork's `master` mirror
 rebuild `watermelon-2` as master plus the open PR branches, re-run the
 guard in this repository (`swift test` with a fresh `--scratch-path`,
 plus `make asan-test` — the compound-lifetime regressions only abort
-under AddressSanitizer), then refresh the copied (non-symlink) headers under
-`Dependencies/smb2-module/` against the submodule's (the module map
-imports the submodule's headers while the C target compiles against
-the copies), tag the pin on `watermelon-2` and update the submodule
-pointer. When testing intermediate submodule commits,
+under AddressSanitizer), then tag the pin on `watermelon-2` and update the submodule
+pointer. (`Dependencies/smb2-module/` resolves entirely through
+symlinks into the submodule's headers — there are no copied headers
+to refresh.) When testing intermediate submodule commits,
 build with `swift test --scratch-path <dir>`: a shared `.build`
 produces stale results and drifting sanitizer reports across
 checkouts.
@@ -136,7 +135,12 @@ read stream).
   aarch64 targets (BSD/Windows/Android) the runtime probe returns 0,
   so those builds keep the portable path. Upstream's autotools also
   fails in libdcerpc under `--without-libkrb5` on a pristine
-  checkout — pre-existing, not this fork's.
+  checkout — pre-existing, not this fork's. Building with GCC >= 12 at
+  `-O3 -Wall -Werror` trips `-Wmaybe-uninitialized` on the CMAC iov
+  fast path — the same warning upstream's AES-NI twin produces, so a
+  pre-existing pattern, not this fork's; AROS also has no CI job, and
+  the only public AROS toolchain container cannot build the tree
+  (upstream `sys/unistd.h` gap).
 - Upstream's Apple build config has no accelerated AES backend: SMB3
   encryption/signing runs the portable C AES (~52 MB/s seal, ~100 MB/s
   signing on arm64; cf. upstream issue #500). The fork's answer is

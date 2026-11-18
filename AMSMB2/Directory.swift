@@ -22,7 +22,7 @@ struct SMB2DirectoryEntry {
 final class SMB2Directory: Collection {
     private let entries: [SMB2DirectoryEntry]
 
-    init(_ path: String, on client: SMB2Client) throws {
+    init(_ path: String, on client: SMB2Client, maxEntries: Int? = nil) throws {
         let (_, handle) = try client.async_await(dataHandler: OpaquePointer.init) { context, cbPtr -> Int32 in
             smb2_opendir_async(context, path, SMB2Client.generic_handler, cbPtr)
         }
@@ -40,6 +40,15 @@ final class SMB2Directory: Collection {
             var entries = [SMB2DirectoryEntry]()
             while let entry = smb2_readdir(context, dir)?.pointee {
                 guard let name = entry.name else { continue }
+                // Bound the drain itself: a hostile flat-wide directory can
+                // exceed a caller-supplied budget inside this one loop,
+                // where the caller's per-pop check never gets to run.
+                if let maxEntries, entries.count >= maxEntries {
+                    throw POSIXError(
+                        .fileTooLarge,
+                        description: "Directory listing exceeded \(maxEntries) entries; the server may be hostile."
+                    )
+                }
                 entries.append(.init(name: String(cString: name), st: entry.st))
             }
             return entries

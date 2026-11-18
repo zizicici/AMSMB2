@@ -604,6 +604,9 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             rejected with an error instead of being ignored.
        - path: The path of a file or directory.
        - completionHandler: closure will be run after operation is completed.
+
+     The flag update is a read-modify-write and not atomic: a concurrent
+     attribute writer on another connection can interleave and lose its update.
      */
     open func setAttributes(
         attributes: [URLResourceKey: Any],
@@ -697,8 +700,14 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
             `contentModificationDateKey`, `attributeModificationDateKey`,
             `isUserImmutableKey`, `isSystemImmutableKey` and `isHiddenKey`.
             You can change single attributes or any combination of attributes;
-            you need not specify keys for all attributes.
+            you need not specify keys for all attributes. Attribute flags the
+            dictionary does not mention keep their current values, a `false`
+            value clears the corresponding flag, and values of the wrong type
+            are rejected with an error.
        - path: The path of a file or directory.
+
+     The flag update is a read-modify-write and not atomic: a concurrent
+     attribute writer on another connection can interleave and lose its update.
      */
     open func setAttributes(attributes: [URLResourceKey: Any], ofItemAtPath path: String) async throws {
         try await withCheckedThrowingContinuation { continuation in
@@ -1088,8 +1097,9 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      Fetches data contents of a file from an offset with specified length. With reporting progress
      per negotiated I/O chunk (64KiB to 8MiB).
 
-     - Note: If range's lowerBound is bigger than file's size, an empty `Data` will be returned.
-             If range's length exceeds file, returned data will be truncated to entire file content from given offset.
+     - Note: If range's lowerBound is bigger than file's size, the stream finishes
+             without yielding any element. If range's length exceeds file, returned data will
+             be truncated to entire file content from given offset.
 
      - Parameters:
        - atPath: path of file to be fetched.
@@ -1098,7 +1108,12 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
 
      The stream is pull-driven: each chunk is read from the server only when the
      consumer asks for the next element, so memory stays at one chunk no matter
-     how slow the consumer is or how large the file is.
+     how slow the consumer is or how large the file is. An error surfaced by a
+     failing read ends the iteration at that point (earlier chunks stay with the
+     consumer); iteration does not register with the manager's operation count,
+     so `disconnectShare(gracefully: true)` does not wait for it and the next
+     pull fails once the connection is down. A stream abandoned mid-iteration
+     has its file handle closed asynchronously when the stream is released.
      */
     @available(swift 5.9)
     open func contents<R: RangeExpression>(
@@ -1261,10 +1276,11 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      - Important: Stream will be closed eventually if is not already opened when passed.
 
      - Note: The library applies backpressure itself (at most ~4 MiB is buffered ahead of the
-         network), but an `AsyncThrowingStream` built with the default unbounded buffering policy
-         defeats it — `yield` never waits, so a fast producer accumulates unbounded memory in the
-         stream itself. Pass a bounded `bufferingPolicy` (or produce via `unfolding`) when the
-         producer can outrun the network.
+         network, plus any single element larger than that — the buffer always admits one
+         oversized element rather than deadlock), but an `AsyncThrowingStream` built with the
+         default unbounded buffering policy defeats it — `yield` never waits, so a fast producer
+         accumulates unbounded memory in the stream itself. Pass a bounded `bufferingPolicy`
+         (or produce via `unfolding`) when the producer can outrun the network.
 
      - Parameters:
        - stream: input stream that provides data to be written to file.
@@ -1298,10 +1314,11 @@ public class SMB2Manager: NSObject, NSSecureCoding, Codable, NSCopying, CustomRe
      - Important: Stream will be closed eventually if is not already opened when passed.
 
      - Note: The library applies backpressure itself (at most ~4 MiB is buffered ahead of the
-         network), but an `AsyncThrowingStream` built with the default unbounded buffering policy
-         defeats it — `yield` never waits, so a fast producer accumulates unbounded memory in the
-         stream itself. Pass a bounded `bufferingPolicy` (or produce via `unfolding`) when the
-         producer can outrun the network.
+         network, plus any single element larger than that — the buffer always admits one
+         oversized element rather than deadlock), but an `AsyncThrowingStream` built with the
+         default unbounded buffering policy defeats it — `yield` never waits, so a fast producer
+         accumulates unbounded memory in the stream itself. Pass a bounded `bufferingPolicy`
+         (or produce via `unfolding`) when the producer can outrun the network.
 
      - Parameters:
        - stream: input stream that provides data to be written to file.
@@ -1768,7 +1785,14 @@ extension SMB2Manager {
                     entries: contents.count, pathUTF16Count: current.utf16.count
                 )
             }
-            let dir = try SMB2Directory(current.trimmedPath, on: client)
+            // The per-pop budget check above cannot see inside this
+            // directory's drain, so hand the remaining budget down and let
+            // the drain abort mid-way on a hostile flat-wide listing.
+            let dir = try SMB2Directory(
+                current.trimmedPath, on: client,
+                maxEntries: recursive
+                    ? SMB2Manager.recursiveListingMaxEntries - contents.count : nil
+            )
             var subDirectories = [String]()
             for ent in dir {
                 let name = ent.name
@@ -2056,6 +2080,16 @@ final class SMB2StreamReadCursor: @unchecked Sendable {
         try? open?.close()
     }
 
+    deinit {
+        // A consumer that abandons the stream mid-way never pulls again, so
+        // finish() may never run. Close asynchronously here — never block
+        // the releasing thread, close can wait on the context lock behind
+        // an in-flight read.
+        if let file {
+            DispatchQueue.global().async { try? file.close() }
+        }
+    }
+
     func nextChunk() throws -> Data? {
         guard !finished, offset < upperBound else {
             finish()
@@ -2070,7 +2104,12 @@ final class SMB2StreamReadCursor: @unchecked Sendable {
             handle = file
         } else {
             handle = try SMB2FileHandle(forReadingAtPath: path, on: client)
-            try handle.seek(offset: offset, from: .start)
+            do {
+                try handle.seek(offset: offset, from: .start)
+            } catch {
+                try? handle.close()
+                throw error
+            }
             file = handle
         }
         do {

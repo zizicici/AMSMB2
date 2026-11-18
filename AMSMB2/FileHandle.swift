@@ -330,7 +330,9 @@ final class SMB2FileHandle: @unchecked Sendable {
                 )
             }
         }
-        return buffer.prefix(Int(result))
+        // Copy like read(length:) does: a bare slice pins the whole chunk
+        // buffer for as long as the caller holds the result.
+        return Data(buffer.prefix(Int(result)))
     }
 
     var maxWriteSize: Int {
@@ -470,14 +472,14 @@ final class SMB2FileHandle: @unchecked Sendable {
             let maxOutputResponse = UInt32(
                 max(0, min(65_535, client.maximumTransactionSize - 8 - buf.count))
             )
-            return try client.async_await_pdu(dataHandler: R.init) { [handle] context, cbPtr
+            return try client.async_await_pdu(dataHandler: R.init) { context, cbPtr
                 -> UnsafeMutablePointer<smb2_pdu>? in
-                // file_id is resolved here, under the context lock: the
-                // teardown sweep frees closed file handles, so touching the
-                // handle outside the lock races a concurrent disconnect.
+                // file_id is resolved here, under the context lock (a capture
+                // list would read the ivar outside it): the teardown sweep
+                // and a concurrent close free file handles there.
                 var req = smb2_ioctl_request(
                     ctl_code: command.rawValue,
-                    file_id: smb2_get_file_id(try handle.unwrap()).pointee,
+                    file_id: smb2_get_file_id(try self.handle.unwrap()).pointee,
                     input_offset: 0, input_count: .init(buf.count),
                     max_input_response: 0,
                     output_offset: 0, output_count: UInt32(client.maximumTransactionSize),
@@ -960,6 +962,9 @@ extension smb2_stat_64 {
         // through this API is observable (absent = flag not set).
         if smb2_attributes & UInt32(SMB2_FILE_ATTRIBUTE_READONLY) != 0 {
             dic[.isUserImmutableKey] = true
+        }
+        if smb2_attributes & UInt32(SMB2_FILE_ATTRIBUTE_SYSTEM) != 0 {
+            dic[.isSystemImmutableKey] = true
         }
         if smb2_attributes & UInt32(SMB2_FILE_ATTRIBUTE_HIDDEN) != 0 {
             dic[.isHiddenKey] = true

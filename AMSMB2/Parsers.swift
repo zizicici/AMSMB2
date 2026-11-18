@@ -125,7 +125,9 @@ extension DecodableResponse {
 #if canImport(Darwin)
         let pageSize = sysconf(_SC_PAGESIZE)
         let base = UnsafeMutableRawPointer(bitPattern: (size_t(bitPattern: output) / pageSize) * pageSize)
-        if msync(base, pageSize, MS_ASYNC) != 0 {
+        // Cover the whole decoded range, not just the first page: a mapping
+        // can end between base+pageSize and base+length.
+        if msync(base, length, MS_ASYNC) != 0 {
             self = try Self(data: .init())
             return
         }
