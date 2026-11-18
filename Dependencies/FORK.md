@@ -47,6 +47,16 @@ assembled pin line, rebuilt as master + the staged lines after each
 upstream sync. Historical lines are preserved under the
 `amsmb2-fork-N` tags.
 
+## Where libsmb2 work happens
+
+All libsmb2 changes happen in the standalone checkout
+`/Users/zici/Documents/GitHub/zizicici/libsmb2` (the review copy —
+`watermelon` is checked out there and other reviewers look at it).
+The `Dependencies/libsmb2` submodule directory is a read-only follower:
+after pushing from the standalone repo, update it with
+`git submodule update --remote Dependencies/libsmb2` and commit the
+moved gitlink here. Never edit inside the submodule directory.
+
 ## Syncing with upstream
 
 Fast-forward the fork's `master` mirror
