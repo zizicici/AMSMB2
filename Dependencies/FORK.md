@@ -52,10 +52,13 @@ upstream sync. Historical lines are preserved under the
 All libsmb2 changes happen in the standalone checkout
 `/Users/zici/Documents/GitHub/zizicici/libsmb2` (the review copy —
 `watermelon` is checked out there and other reviewers look at it).
-The `Dependencies/libsmb2` submodule directory is a read-only follower:
-after pushing from the standalone repo, update it with
-`git submodule update --remote Dependencies/libsmb2` and commit the
-moved gitlink here. Never edit inside the submodule directory.
+The `Dependencies/libsmb2` submodule directory is a read-only follower.
+The local config points the submodule at the standalone repo
+(`git config submodule.Dependencies/libsmb2.url <standalone path>`,
+overriding the GitHub url in `.gitmodules`, which stays correct for
+other clones), so `git submodule update --remote Dependencies/libsmb2`
+picks up even unpushed commits from it directly; commit the moved
+gitlink here afterwards. Never edit inside the submodule directory.
 
 ## Syncing with upstream
 
