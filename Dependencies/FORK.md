@@ -1,11 +1,13 @@
 # libsmb2 fork
 
-`Dependencies/libsmb2` tracks the `watermelon` branch of
+`Dependencies/libsmb2` tracks the `watermelon-2` branch of
 [zizicici/libsmb2](https://github.com/zizicici/libsmb2) (see `branch` in
-`.gitmodules`). The fork repo's `master` is a plain mirror of upstream
+`.gitmodules`) — upstream master plus both staged lines (`pr-b` and
+#521's AES). The fork repo's `master` is a plain mirror of upstream
 [sahlberg/libsmb2](https://github.com/sahlberg/libsmb2) and never
-carries fork work; `amsmb2-fork-N` tags on `watermelon` mark reviewed
-pins — currently `amsmb2-fork-15`.
+carries fork work; `amsmb2-fork-N` tags on the pin line mark reviewed
+pins — currently `amsmb2-fork-16` (on the pre-#521 line; the
+`watermelon-2` tip gets its tag after the current review round).
 
 ## State after the November 2026 upstream sync
 
@@ -17,40 +19,46 @@ queued from an abort callback — the simple variant of what this fork
 had prototyped as a parking list). The fork's parking-list prototype was
 dropped in favor of his direction.
 
-`master..watermelon` is now just the two open PRs (6 commits, strictly
-ahead — no divergence):
+The write-reply clamps went upstream as #514 (merged), together with
+the notify errno conversion. The pin line (`watermelon-2`) carries the
+two staged lines on top of upstream master, each strictly ahead:
 
-- `pr-a` (upstream #514, open): reject forged write replies — the
-  reply-count clamp, the on-wire-amount baseline and the pwrite-side
-  encoder-aligned 64 KiB clamp, plus the negotiated-size 8 MiB cap and
-  the notify errno conversion.
-- `pr-b` (to submit after #514 merges; same clamp region): the credit
-  balance bound and the zero-negotiated-size clamp skip.
+- `pr-b`: the credit balance bound and the zero-negotiated-size clamp
+  skip (same clamp region as #514; submit once its follow-up window
+  opens).
+- `pr-aes` (upstream #521, open): AES-128 on the ARMv8 crypto
+  extensions — the x86 AES-NI treatment ported to arm64, with a
+  runtime `getauxval`/architectural dispatch and portable stubs where
+  the extension is unavailable. A single commit on top of upstream
+  master.
 
-Branch layout: `master` = upstream mirror; `pr-a`/`pr-b` = staging
-branches for the open PRs (rebuild them, not `watermelon`, when a PR
-needs changes); `watermelon` = the assembled pin line, rebuilt as
-master + the open PR branches after each upstream sync. Historical
-lines are preserved under the `amsmb2-fork-N` tags.
+Branch layout: `master` = upstream mirror; `pr-aes`/`pr-b` = staging
+branches for the open PRs (rebuild them, not the pin line, when a PR
+needs changes); `watermelon-2` = the assembled pin line, rebuilt as
+master + the open PR branches after each upstream sync (`watermelon`
+was the pre-#521 pin line and stays as the pr-b-equivalent tip).
+Historical lines are preserved under the `amsmb2-fork-N` tags.
 
 ## Syncing with upstream
 
 Fast-forward the fork's `master` mirror
-(`git fetch upstream && git push origin upstream/master:master`), merge
-`master` into `watermelon`, re-run the guard in this repository
-(`make asan-test` — the compound-lifetime regressions only abort under
-AddressSanitizer), then tag the merge on `watermelon` and update the
-submodule pointer. When testing intermediate submodule commits, build
-with `swift test --scratch-path <dir>`: a shared `.build` produces
-stale results and drifting sanitizer reports across checkouts.
+(`git fetch upstream && git push origin upstream/master:master`),
+rebuild `watermelon-2` as master plus the open PR branches, re-run the
+guard in this repository (`swift test` with a fresh `--scratch-path`,
+plus `make asan-test` — the compound-lifetime regressions only abort
+under AddressSanitizer), then tag the pin on `watermelon-2` and update
+the submodule pointer. When testing intermediate submodule commits,
+build with `swift test --scratch-path <dir>`: a shared `.build`
+produces stale results and drifting sanitizer reports across
+checkouts.
 
 ## Regression coverage in this repository
 
 The compound-timeout, seal-abort, fstat-tag, refused-connect and
 handle-sweep tests now guard upstream-merged code and stay as
 regression walls. Fork-specific guards: `test_WriteClampMatchesEncodeLayerForNonMultiCredit`
-and the zero-progress write test (PR #514 content — will move to
-"upstream" once merged), `test_NegativeCreditBalanceNeverInflatesQueuedRequests`
+and the zero-progress write test (upstream #514 content),
+`test_NegativeCreditBalanceNeverInflatesQueuedRequests`
 and `test_CreditGrantsAreCappedAtMaxCredits` (pr-b content),
 `test_RandomBytesComeFromAStrongSource` (upstream CSPRNG selection —
 kept because it fails if a future config regression drops the define).
@@ -79,7 +87,16 @@ kept because it fails if a future config regression drops the define).
   is the share root for reads but fails inconsistently per API.
 - A change-notify reply with an empty output buffer is swallowed as an
   empty change list.
-- The Apple build config has no accelerated AES backend: SMB3
+- The CCM parameter domain of the portable (and, being a mirror of it,
+  the ARMv8) implementation is unchecked: `nlen >= 16` overflows the
+  nonce staging buffers, `mlen > 16` reads past the tag, `mlen == 0`
+  produces an empty authentication field, an `alen >= 65536` wraps its
+  BE16 encoding, and `plen > 2 GiB` truncates the BE32 length. All
+  in-library callers stay inside the safe domain (nonce 11, tag 16,
+  bounded AAD/payload), so these are unreachable from AMSMB2; a future
+  parameter-domain sweep for the portable path would cover both.
+- Upstream's Apple build config has no accelerated AES backend: SMB3
   encryption/signing runs the portable C AES (~52 MB/s seal, ~100 MB/s
-  signing on arm64). Fixing this needs CommonCrypto cryptor reuse or
-  armv8 crypto intrinsics (cf. upstream issue #500).
+  signing on arm64; cf. upstream issue #500). The fork's answer is
+  `pr-aes` / upstream #521 (ARMv8 crypto extensions, ~0.9 GB/s seal,
+  ~2.4 GB/s signing); `watermelon` picks it up once it merges.
