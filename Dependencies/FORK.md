@@ -119,11 +119,16 @@ read stream).
 - The CCM parameter domain of the portable (and, being a mirror of it,
   the ARMv8) implementation is unchecked: `nlen >= 16` overflows the
   nonce staging buffers, `mlen > 16` reads past the tag, `mlen == 0`
-  produces an empty authentication field, an `alen >= 65536` wraps its
-  BE16 encoding, and `plen > 2 GiB` truncates the BE32 length. All
-  in-library callers stay inside the safe domain (nonce 11, tag 16,
-  bounded AAD/payload), so these are unreachable from AMSMB2; a future
-  parameter-domain sweep for the portable path would cover both.
+  produces an empty authentication field, and `plen > 2 GiB` truncates
+  the BE32 length. AAD is also wrong past the two-byte encoding's
+  range: RFC 3610 requires the extended length encoding from 65,280
+  bytes on, and against OpenSSL the tags diverge for exactly those
+  lengths (65,279 matches; 65,280 and 65,536 mismatch on every input
+  tried) in both implementations. All in-library callers stay inside
+  the safe domain (nonce 11, tag 16, AAD fixed at the 32-byte transform
+  header, bounded payload), so these are unreachable from AMSMB2; a
+  future parameter-domain sweep for the portable path would cover
+  both.
 - Task cancellation is not propagated into in-flight SMB2 commands
   (no `withTaskCancellationHandler` anywhere): a cancelled task's
   command still runs to completion or timeout, and with `timeout = 0`
